@@ -228,8 +228,11 @@ sudo ./semaphorin.sh 11.3 --diagnose --diagnose-mount-test
 Prompts `Type YES (all caps) to proceed...`, then runs the real
 `mount_filesystems` once with full captured output, checks the resulting
 mount table, and unmounts again. This is the only place in `--diagnose`
-that performs a real mount, and it still never touches `seputil` or SEP
-firmware.
+that performs a real mount. **Correction:** this used to claim it never
+touches `seputil` or the SEP. That was wrong: `mount_filesystems` is a script
+that itself runs `seputil --gigalocker-init` and `seputil --load` (see section
+11), so `--diagnose-mount-test` does talk to the SEP and mounts read-write.
+`--diagnose-sep` is the careful alternative.
 
 Never does: restore, wipe, nand/activation backup-and-restore, NVRAM writes,
 or anything from the "Main operation mode" list other than booting the
@@ -486,3 +489,42 @@ is ignored).
 option names and messages with `grep` (the binary is **never executed**). If it
 has a status/version style option, that is the safe way to read SEP state
 before any `--load`.
+
+## 14. Third real-hardware run: xART, and the SEP steps
+
+### Facts (observed, run of 14:23)
+- System (`sealed`), Preboot **and xART** all mounted read-only without an
+  error, and were unmounted cleanly; the SSH link stayed alive throughout.
+  So every mount `mount_filesystems` needs before the SEP steps works
+  read-only on this device.
+- `mount_filesystems` makes 14 `seputil` references (the two calls per
+  branch discussed in section 11).
+
+### What this changes
+- The original `mount_apfs: ... No such file or directory` is **not** from
+  mounting System, Preboot or xART read-only.
+- Over SSH, stdout and stderr are separate channels, so the order of the
+  `mount_apfs` error and the `seputil:` lines in the original reports is not
+  reliable. The last step of the script, `mount_apfs /dev/disk0s1s2 /mnt2`
+  (the **Data** volume), runs after `seputil --load`. Hypothesis, not a
+  finding: that mount fails because the SEP did not load properly, which would
+  make the ENOENT a symptom of the SEP failure, not a separate problem.
+
+### Correction
+Earlier text claimed `--diagnose-mount-test` never touches `seputil`/SEP. That
+was wrong (see section 6): `mount_filesystems` itself runs
+`seputil --gigalocker-init` and `seputil --load`. The warning text, help and
+docs were fixed.
+
+### New opt-in stage: `--diagnose-sep`
+```
+sudo ./semaphorin.sh 11.3 --diagnose --diagnose-sep
+```
+Implies `--diagnose-apfs-ro` (volumes stay read-only). Then, one at a time and
+each behind its own typed `YES`: `seputil --gigalocker-init`, then
+`seputil --load /mnt6/<active>/usr/standalone/firmware/sep-firmware.img4`.
+After each step it logs the exit code and whether the SSH link is alive; if
+the link dies it logs the step and the USB mode 1/3/6 s later (ramdisk /
+recovery / dfu / none). The Data volume is never mounted. Exercised against a
+mocked SSH only (success, decline, non-zero exit, link drop); not yet run on
+hardware.

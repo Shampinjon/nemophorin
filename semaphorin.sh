@@ -175,6 +175,10 @@ Main operation mode:
                                 APFS/SEP state without mounting, wiping, or restoring anything
     --update                   Check for a newer version, update without asking, then exit
     --no-update-check          Skip the startup check for a newer version
+    --diagnose-sep             With --diagnose: after the read-only mounts, runs the two SEP steps of
+                                mount_filesystems one at a time (seputil --gigalocker-init, then
+                                seputil --load), each behind its own YES. Talks to the SEP; volumes
+                                stay read-only and nothing is written. Implies --diagnose-apfs-ro.
     --diagnose-compact         With --diagnose: short one-line summaries instead of the full dumps
                                 (mount_filesystems source, directory scans, apfs.fs listing)
     --diagnose-apfs-ro         With --diagnose: probes APFS volume roles and mounts System/Preboot
@@ -182,7 +186,7 @@ Main operation mode:
                                 separate an APFS mount failure from a SEP failure. Needs YES.
     --diagnose-mount-test      With --diagnose: explicitly also attempts a real mount_filesystems
                                 call (with full, non-redirected output) to see exactly how/where it
-                                fails. Risky - requires typed confirmation. Never auto-loads SEP fw.
+                                fails. RISKY: the script itself runs seputil --gigalocker-init and --load (SEP).
 
 The iOS version argument should be the iOS version you are downgrading to.
 EOF
@@ -327,6 +331,10 @@ parse_opt() {
             diagnose_mount_test=1
             ;;
         --diagnose-apfs-ro)
+            diagnose_apfs_ro=1
+            ;;
+        --diagnose-sep)
+            diagnose_sep=1
             diagnose_apfs_ro=1
             ;;
         --diagnose-compact)
@@ -1891,8 +1899,10 @@ _kill_if_running() {
 _diag_mount_test() {
     _log_warn "--diagnose-mount-test requested. This will run the real mount_filesystems"
     _log_warn "tool with its full, unredirected output so we can see exactly how it fails."
-    _log_warn "It does NOT touch SEP firmware, but a crash in mount_filesystems itself can"
-    _log_warn "still wedge the ramdisk and force a power-cycle of the device."
+    _log_warn "mount_filesystems is a script that itself runs 'seputil --gigalocker-init' and"
+    _log_warn "'seputil --load', so this DOES talk to the SEP and mounts volumes read-write."
+    _log_warn "It can drop the SSH link, wedge the ramdisk or force a power-cycle."
+    _log_warn "Prefer --diagnose-sep, which does the same steps one at a time, read-only."
     read -p "Type YES (all caps) to proceed with the live mount_filesystems test: " confirm
     if [[ "$confirm" != "YES" ]]; then
         _log_info "Mount test declined by user. Skipping."
@@ -1926,6 +1936,46 @@ _diag_mount_test() {
     _diag_ssh "umount /mnt1" "/sbin/umount /mnt1"
     _diag_ssh "umount /mnt2" "/sbin/umount /mnt2"
     _diag_ssh "umount /mnt6" "/sbin/umount /mnt6"
+    return 0
+}
+
+# The two SEP calls mount_filesystems makes, run one at a time with their own
+# confirmation, a liveness check and the exit code after each. Volumes are still
+# mounted read-only by the caller, so nothing is written to the device.
+_diag_sep_steps() {
+    local active="$1" seputil="/usr/libexec/seputil" ans fw
+    _log_warn "--diagnose-sep: the next steps TALK TO THE SEP (the same two seputil calls mount_filesystems makes)."
+    _log_warn "Volumes stay read-only. A failure can still drop the SSH link or panic the ramdisk kernel."
+    read -p "Step 1: run 'seputil --gigalocker-init'? Type YES to run, anything else to stop here: " ans
+    if [[ "$ans" != "YES" ]]; then
+        _log_info "Stopped before seputil --gigalocker-init."
+        return 0
+    fi
+    _diag_ssh "seputil --gigalocker-init" "$seputil --gigalocker-init 2>&1"
+    local rc1=$diag_last_rc
+    if [ "$ssh_connection_lost" = "1" ]; then
+        _log_stop "SSH dropped during seputil --gigalocker-init - this is the exact point of failure."
+        return 255
+    fi
+    _log_info "seputil --gigalocker-init finished with exit code $rc1 and the SSH link is alive"
+
+    if [ -n "$active" ]; then
+        fw="/mnt6/$active/usr/standalone/firmware/sep-firmware.img4"
+    else
+        fw="/mnt1/usr/standalone/firmware/sep-firmware.img4"
+    fi
+    read -p "Step 2: run 'seputil --load $fw'? Type YES to run, anything else to stop here: " ans
+    if [[ "$ans" != "YES" ]]; then
+        _log_info "Stopped before seputil --load."
+        return 0
+    fi
+    _diag_ssh "seputil --load $fw" "$seputil --load $fw 2>&1"
+    local rc2=$diag_last_rc
+    if [ "$ssh_connection_lost" = "1" ]; then
+        _log_stop "SSH dropped during seputil --load - this is the exact point of failure."
+        return 255
+    fi
+    _log_info "seputil --load finished with exit code $rc2 and the SSH link is alive"
     return 0
 }
 
@@ -1988,6 +2038,10 @@ _diag_apfs_ro_test() {
         _diag_fetch_sep "$active"
     else
         _log_warn "No /mnt6/active - seputil --load would fall back to /mnt1/usr/standalone/firmware/sep-firmware.img4"
+    fi
+    if [[ "$diagnose_sep" == 1 ]]; then
+        _diag_sep_steps "$active"
+        [ "$ssh_connection_lost" = "1" ] && return 255
     fi
     _diag_ssh "umount /mnt7" "/sbin/umount /mnt7 2>&1; exit 0"
     _diag_ssh "umount /mnt6" "/sbin/umount /mnt6"
