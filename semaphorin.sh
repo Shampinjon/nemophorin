@@ -1898,7 +1898,6 @@ _run_diagnose() {
     _log_ok "SSH ramdisk is reachable"
 
     _diag_ssh "uname -a" "uname -a"
-    _diag_ssh "uptime (how long the ramdisk has been up)" "uptime" 2>/dev/null
 
     _log_info "APFS inspection started (read-only; mount_filesystems is NOT called automatically)"
     _diag_ssh "current mount table" "/sbin/mount"
@@ -1907,18 +1906,21 @@ _run_diagnose() {
     _diag_ssh "raw disk device nodes" "ls -la /dev/ 2>/dev/null | grep -i disk"
     [ "$ssh_connection_lost" = "1" ] && { _log_stop "Lost SSH while listing /dev disk nodes"; return 1; }
 
-    for tool in mount_apfs mount_filesystems seputil fsck_apfs newfs_apfs; do
-        _diag_ssh "locate $tool" "command -v $tool 2>/dev/null || which $tool 2>/dev/null"
-        if [ "$ssh_connection_lost" = "1" ]; then
-            _log_stop "Lost SSH while locating $tool"
-            return 1
-        fi
-        if [ -n "$diag_last_output" ]; then
-            _diag_ssh "metadata for $tool" "ls -la $diag_last_output 2>/dev/null"
-        else
-            _log_warn "$tool not found in PATH on this ramdisk"
-        fi
-    done
+    # The ramdisk's non-interactive PATH is minimal and mount_filesystems is a
+    # wrapper that may call tools by absolute path, so a `command -v` lookup
+    # gives false "not found" results. Scan the standard directories instead.
+    _diag_ssh "APFS/SEP-related executables in standard directories" \
+        "for d in /sbin /usr/sbin /usr/bin /usr/libexec /usr/local/bin /usr/local/sbin; do echo \"== \$d\"; ls -la \$d 2>/dev/null | grep -i -E 'apfs|seputil|sepos|mount|fsck|keybag'; done"
+    if [ "$ssh_connection_lost" = "1" ]; then
+        _log_stop "Lost SSH while scanning for APFS/SEP tools"
+        return 1
+    fi
+    # Read-only: shows exactly which tools/paths the wrapper invokes.
+    _diag_ssh "contents of /usr/bin/mount_filesystems (read-only cat)" "cat /usr/bin/mount_filesystems"
+    if [ "$ssh_connection_lost" = "1" ]; then
+        _log_stop "Lost SSH while reading mount_filesystems"
+        return 1
+    fi
     _log_info "APFS/SEP tool availability check complete (none of them were executed)"
 
     _log_info "SEP firmware inspection started"
@@ -1941,7 +1943,7 @@ _run_diagnose() {
         for f in iBSS.img4 iBEC.img4 kernelcache.img4 devicetree.img4 trustcache.img4 ramdisk.img4; do
             if [ -e "$rd_dir/$f" ]; then
                 local sz
-                sz=$(wc -c < "$rd_dir/$f" 2>/dev/null)
+                sz=$(wc -c < "$rd_dir/$f" 2>/dev/null | tr -d ' ')
                 if [ "${sz:-0}" -eq 0 ]; then
                     _log_error "$f exists but is zero bytes (corrupt/truncated download) at $rd_dir/$f"
                 else
