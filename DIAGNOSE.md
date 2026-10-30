@@ -449,3 +449,40 @@ listing, whole SystemVersion.plist). `--diagnose-compact` folds them into
 summary lines (about 25 lines instead of 300). The SEP firmware copied for
 inspection and the `img4tool` output are stored next to the log and are not
 written into it (the latter contains the device ECID).
+
+## 13. The installed SEP image (`sep-firmware.img4` copied from Preboot)
+
+Source: the file `--diagnose-apfs-ro` copied from
+`/mnt6/<active>/usr/standalone/firmware/` plus its `img4tool -a` dump. The dump
+contains the device ECID and is kept out of the log (and out of git: `logs/`
+is ignored).
+
+### Facts (read from the files)
+- 1,415,361 bytes: an IMG4 with an `IM4P` of type `sepi` (about 1.41 MB) and an
+  `IM4M` manifest of about 7.4 KB. The payload is encrypted (KBAG present).
+- The manifest is **personalised for this device**: `CHIP` 0x8015 (T8015),
+  `BORD` 0x0E, an `ECID`, a boot nonce hash (`BNCH`) and a SEP nonce (`snon`),
+  with `CPRO`/`CSEC`/`SDOM 1` (production, secure). It carries digests for
+  the usual boot components plus `sepi`.
+- The `desc` blob decodes to a SEP memory layout (`impl1`, `arms`=0xcc0000,
+  `tz0s`=0xadc8000).
+- The `love` tag decodes to `20.8.392.0.0,0`, a Darwin-20 style (iOS 14 era)
+  version string, not a 16.x one. I could not map it to an exact build, so
+  treat it as weak evidence only.
+
+### What this does and does not tell us
+- It shows the on-disk SEP image was personalised for this device and this
+  ECID, which fits a restore that happened shortly before the mtime (07:41).
+- It does **not** show that `seputil --load` accepts it. A personalised SEP
+  image is bound to nonces (`snon`, `BNCH`); whether the SEP's current state
+  still matches, or whether the SEP is already running (the
+  `kIOReturnBusy` idea in section 11), can only be learned from the SEP
+  itself.
+- Not yet done: comparing the on-disk image against what the 14.3 ramdisk
+  kernel's SEP driver expects.
+
+### Next, without touching the SEP
+`--diagnose` now copies `/usr/libexec/seputil` to the host and extracts its
+option names and messages with `grep` (the binary is **never executed**). If it
+has a status/version style option, that is the safe way to read SEP state
+before any `--load`.

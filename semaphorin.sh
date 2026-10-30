@@ -2015,6 +2015,25 @@ _diag_fetch_sep() {
     fi
 }
 
+# Static look at /usr/libexec/seputil: copy it to the host and extract option
+# names and messages with grep. The binary is never executed, so the SEP is
+# not touched. Tells us which read-only options (status/version/...) exist.
+_diag_inspect_seputil() {
+    local f="${diagnose_log%.log}_seputil.bin"
+    if ! "$bin"/sshpass -p 'alpine' scp -o StrictHostKeyChecking=no -o ConnectTimeout=8 -P 2222 \
+        "root@localhost:/usr/libexec/seputil" "$f" 2> /dev/null; then
+        _log_warn "could not copy /usr/libexec/seputil for static inspection"
+        return 0
+    fi
+    local all="${f}.strings.txt" line
+    LC_ALL=C grep -a -o -E '[[:print:]]{5,}' "$f" > "$all" 2> /dev/null
+    _log_ok "copied seputil ($(wc -c < "$f" | tr -d ' ') bytes) for static inspection, NOT executed; all strings: $all"
+    _log_info "seputil options found in the binary: $(LC_ALL=C grep -a -o -E -- '--[a-z][a-z0-9-]+' "$f" | sort -u | tr '\n' ' ')"
+    while IFS= read -r line; do
+        _log_info "seputil string: $line"
+    done < <(grep -i -E 'usage|nonce|status|load fw|gigalocker|panic|sepos|boot' "$all" | head -40)
+}
+
 _run_diagnose() {
     mkdir -p "$dir"/logs
     diagnose_log="$dir"/logs/diagnose_${deviceid}_$(date -u +%Y%m%d_%H%M%S).log
@@ -2050,6 +2069,7 @@ _run_diagnose() {
         _log_stop "Lost SSH during the passive ramdisk checks"
         return 1
     fi
+    _diag_inspect_seputil
 
     if [[ "$diagnose_compact" != 1 ]]; then
         _log_info "full dumps follow (use --diagnose-compact for a short log)"
