@@ -231,9 +231,33 @@ _diag_ssh() {
     diag_last_output="$out"
     diag_last_rc=$rc
     if [ "$rc" -eq 255 ]; then
+        # ssh exits 255 both on a connection error AND when the remote command
+        # itself exits 255, so confirm with an independent liveness probe.
+        local alive
+        alive=$("$bin"/sshpass -p 'alpine' ssh \
+            -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=5 \
+            -o ServerAliveInterval=3 \
+            -o ServerAliveCountMax=2 \
+            -p2222 root@localhost "echo semaphorin_alive" 2>&1)
+        if [[ "$alive" == *"semaphorin_alive"* ]]; then
+            _log_warn "$desc (remote command exited 255; SSH link is still alive)"
+            [ -n "$out" ] && _log_warn "output: $out"
+            return 1
+        fi
         ssh_connection_lost=1
         _log_stop "SSH connection lost during: $desc"
         [ -n "$out" ] && _log_error "Last output before disconnect: $out"
+        _log_error "Liveness probe after the drop failed: ${alive:-<no output>}"
+        # Tell a kernel panic/reset apart from a dead sshd: ramdisk = kernel
+        # still up, recovery/dfu = the device reset, none = USB went away.
+        if declare -F get_device_mode > /dev/null; then
+            local delay
+            for delay in 1 3 6; do
+                sleep "$delay"
+                _log_info "USB state ~${delay}s after the drop: $(get_device_mode 2>/dev/null)"
+            done
+        fi
         return 255
     elif [ "$rc" -ne 0 ]; then
         _log_warn "$desc (exit $rc)"

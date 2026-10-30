@@ -399,3 +399,17 @@ Preboot **read-only**, prints `SystemVersion.plist`, the `/mnt6/active` slot
 and the `sep-firmware` file metadata, then unmounts. It never mounts xART or
 Data and never runs `gigalocker-init` or `seputil`, so a failure here is an
 APFS failure, not a SEP failure. Not yet run on hardware.
+
+### First `--diagnose-apfs-ro` run (what it did and did not show)
+- Passive checks: ramdisk is `ProductVersion 14.3 (18C66)`; `/mnt1 /mnt2 /mnt6
+  /mnt7` exist, so a missing mountpoint is **ruled out** as the cause of
+  `mount_apfs ... No such file or directory`.
+- `apfs.util -p /dev/disk0s1s1` printed `System` (slot 1 is System, as
+  `mount_filesystems` assumes) and the run was then reported as an SSH loss,
+  within the same second, before any mount or SEP call.
+- That report was **ambiguous**: `ssh` exits 255 both for a connection error
+  and when the remote command itself exits 255, and no ssh error text was
+  captured. `_diag_ssh` now confirms a 255 with a separate liveness probe and,
+  on a real drop, logs the USB mode 1/3/6 s later (`ramdisk` = kernel still
+  up, `recovery`/`dfu` = device reset, `none` = USB gone). This is the
+  first mechanism in this repo that can tell a panic/reset from a SEP error.
