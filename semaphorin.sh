@@ -474,7 +474,16 @@ _download_ramdisk_boot_files() {
                 ipswurl=$(curl -k -sL "https://api.ipsw.me/v4/device/$deviceid?type=ipsw" | "$bin"/jq '.firmwares | .[] | select(.version=="'10.3.3'")' | "$bin"/jq -s '.[0] | .url' --raw-output)
             fi
         fi
+        if [ -z "$ipswurl" ] || [ "$ipswurl" = "null" ]; then
+            echo "[-] Could not get an IPSW URL for $deviceid iOS $3 from api.ipsw.me (no network/TLS problem, or that version is not listed)." >&2
+            echo "[-] Stopping here instead of passing an empty URL to pzb." >&2
+            exit 1
+        fi
         "$bin"/pzb -g BuildManifest.plist "$ipswurl"
+        if [ ! -s BuildManifest.plist ]; then
+            echo "[-] pzb did not download BuildManifest.plist from $ipswurl - stopping." >&2
+            exit 1
+        fi
         if [ ! -e "$dir"/$1/$cpid/ramdisk/$3/iBSS.dec ]; then
             "$bin"/pzb -g $(awk "/""$replace""/{x=1}x&&/iBSS[.]/{print;exit}" BuildManifest.plist | grep '<string>' |cut -d\> -f2 |cut -d\< -f1) "$ipswurl"
             fn="$(awk "/""$replace""/{x=1}x&&/iBSS[.]/{print;exit}" BuildManifest.plist | grep '<string>' |cut -d\> -f2 |cut -d\< -f1 | sed 's/Firmware[/]dfu[/]//')"
@@ -2263,7 +2272,12 @@ if [[ "$ramdisk" == 1 || "$restore" == 1 || "$diagnose" == 1 || "$dump_blobs" ==
     _kill_if_running iproxy
     if [[ "$ramdisk" == 1 || "$diagnose" == 1 || "$dump_blobs" == 1 || "$dump_nand" == 1 || "$restore_activation" == 1 || "$restore_nand" == 1 || "$restore_mnt1" == 1 || "$restore_mnt2" == 1 || "$disable_NoMoreSIGABRT" == 1 || "$NoMoreSIGABRT" == 1 ]]; then
         rdversion="$version"
-        if [[ "$version" == "10."* || "$version" == "11.0" ]]; then
+        if [[ "$diagnose" == 1 && -n "$r" ]]; then
+            # --diagnose must inspect the same ramdisk --restore uses for its
+            # backup step (ramdisk/$r, the currently installed iOS), not the
+            # ramdisk of the iOS version being downgraded to.
+            rdversion="$r"
+        elif [[ "$version" == "10."* || "$version" == "11.0" ]]; then
             rdversion="10.3.3"
         elif [[ "$deviceid" == "iPhone8,1" && "$version" == "11.0" ]]; then
             rdversion="10.3.3"
