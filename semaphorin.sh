@@ -175,6 +175,8 @@ Main operation mode:
                                 APFS/SEP state without mounting, wiping, or restoring anything
     --update                   Check for a newer version, update without asking, then exit
     --no-update-check          Skip the startup check for a newer version
+    --diagnose-verbose         With --diagnose: also dump the full mount_filesystems script, tool
+                                directory scans and the apfs.fs listing (log is compact otherwise)
     --diagnose-apfs-ro         With --diagnose: probes APFS volume roles and mounts System/Preboot
                                 strictly read-only (no xART, gigalocker, seputil or Data volume) to
                                 separate an APFS mount failure from a SEP failure. Needs YES.
@@ -196,6 +198,8 @@ remote_cmd() {
 # ---------------------------------------------------------------------------
 diagnose_log=""
 ssh_connection_lost=0
+diag_quiet=0
+diag_oneline=0
 _log_ts() {
     date -u +"%Y-%m-%dT%H:%M:%SZ"
 }
@@ -232,6 +236,10 @@ _diag_ssh() {
     rc=$?
     diag_last_output="$out"
     diag_last_rc=$rc
+    # diag_oneline=1 folds multi-line output into one log line; diag_quiet=1
+    # logs nothing for successful/expected-nonzero calls (errors still show).
+    local disp="$out"
+    [ "$diag_oneline" = "1" ] && disp=$(printf '%s' "$out" | tr '\n' ' ')
     if [ "$rc" -eq 255 ]; then
         # ssh exits 255 both on a connection error AND when the remote command
         # itself exits 255, so confirm with an independent liveness probe.
@@ -243,8 +251,10 @@ _diag_ssh() {
             -o ServerAliveCountMax=2 \
             -p2222 root@localhost "echo semaphorin_alive" 2>&1)
         if [[ "$alive" == *"semaphorin_alive"* ]]; then
-            _log_warn "$desc (remote command exited 255; SSH link is still alive)"
-            [ -n "$out" ] && _log_warn "output: $out"
+            if [ "$diag_quiet" != "1" ]; then
+                _log_warn "$desc (remote command exited 255; SSH link is still alive)"
+                [ -n "$out" ] && _log_warn "output: $disp"
+            fi
             return 1
         fi
         ssh_connection_lost=1
@@ -263,10 +273,10 @@ _diag_ssh() {
         return 255
     elif [ "$rc" -ne 0 ]; then
         _log_warn "$desc (exit $rc)"
-        [ -n "$out" ] && _log_warn "output: $out"
-    else
+        [ -n "$out" ] && _log_warn "output: $disp"
+    elif [ "$diag_quiet" != "1" ]; then
         _log_ok "$desc"
-        [ -n "$out" ] && _log_info "output: $out"
+        [ -n "$out" ] && _log_info "output: $disp"
     fi
     return "$rc"
 }
@@ -318,6 +328,9 @@ parse_opt() {
             ;;
         --diagnose-apfs-ro)
             diagnose_apfs_ro=1
+            ;;
+        --diagnose-verbose)
+            diagnose_verbose=1
             ;;
         --update|--no-update-check)
             # handled by _check_for_updates before the device is touched
@@ -1914,50 +1927,85 @@ _diag_mount_test() {
 }
 
 _diag_apfs_ro_test() {
-    _log_warn "--diagnose-apfs-ro: probes APFS volume roles and mounts System and Preboot READ-ONLY."
-    _log_warn "It does NOT mount xART or the Data volume and does NOT run gigalocker-init or seputil,"
-    _log_warn "so the SEP is not involved. A mount_apfs crash could still drop the SSH link."
+    _log_warn "--diagnose-apfs-ro: volume roles + READ-ONLY mounts of System, Preboot and xART."
+    _log_warn "No Data volume, no gigalocker-init, no seputil: the SEP is not involved."
     read -p "Type YES (all caps) to proceed with the read-only APFS test: " confirm
     if [[ "$confirm" != "YES" ]]; then
         _log_info "Read-only APFS test declined by user. Skipping."
         return 0
     fi
     local util="/System/Library/Filesystems/apfs.fs/apfs.util"
-    local preboot_node=""
-    _log_info "APFS role probe (apfs.util -p, the same probe mount_filesystems itself runs first)"
+    local preboot_node="" xart_node="" roles="" n
+    # apfs.util -p prints the role and then exits 255 by design, so the exit
+    # status is ignored and the per-slot calls are logged as one summary line.
+    diag_quiet=1
     for n in 1 2 3 4 5 6 7; do
-        _diag_ssh "role of /dev/disk0s1s$n" "$util -p /dev/disk0s1s$n"
-        [ "$ssh_connection_lost" = "1" ] && return 255
-        if [[ "$diag_last_output" == *"Preboot"* && -z "$preboot_node" ]]; then
-            preboot_node="/dev/disk0s1s$n"
-        fi
+        _diag_ssh "role of disk0s1s$n" "$util -p /dev/disk0s1s$n; exit 0"
+        if [ "$ssh_connection_lost" = "1" ]; then diag_quiet=0; return 255; fi
+        roles="$roles s$n=[$diag_last_output]"
+        [[ "$diag_last_output" == *"Preboot"* && -z "$preboot_node" ]] && preboot_node="/dev/disk0s1s$n"
+        [[ "$diag_last_output" == *"xART"* && -z "$xart_node" ]] && xart_node="/dev/disk0s1s$n"
     done
-    _log_info "Mounting System (/dev/disk0s1s1, the node mount_filesystems assumes) read-only at /mnt1"
-    _diag_ssh "mount_apfs -o rdonly /dev/disk0s1s1 /mnt1" "/sbin/mount_apfs -o rdonly /dev/disk0s1s1 /mnt1"
+    diag_quiet=0
+    _log_info "APFS volume roles:$roles"
+    _log_info "mount_filesystems assumes System=s1 and Data=s2 (fixed) and finds Preboot/xART by role"
+
+    _diag_ssh "mount -o rdonly /dev/disk0s1s1 /mnt1 (System)" "/sbin/mount_apfs -o rdonly /dev/disk0s1s1 /mnt1"
     [ "$ssh_connection_lost" = "1" ] && { _log_stop "SSH dropped during the System mount - this is the exact point of failure."; return 255; }
     local sys_rc=$diag_last_rc
     if [ -n "$preboot_node" ]; then
-        _log_info "Mounting Preboot ($preboot_node) read-only at /mnt6"
-        _diag_ssh "mount_apfs -o rdonly $preboot_node /mnt6" "/sbin/mount_apfs -o rdonly $preboot_node /mnt6"
+        _diag_ssh "mount -o rdonly $preboot_node /mnt6 (Preboot)" "/sbin/mount_apfs -o rdonly $preboot_node /mnt6"
         [ "$ssh_connection_lost" = "1" ] && { _log_stop "SSH dropped during the Preboot mount - this is the exact point of failure."; return 255; }
     else
         _log_warn "No volume reported the Preboot role, so /mnt6 was not mounted."
     fi
-    _diag_ssh "mount table after read-only mounts" "/sbin/mount"
-    if [ "$sys_rc" -eq 0 ]; then
-        _diag_ssh "installed system version (SystemVersion.plist)" "cat /mnt1/System/Library/CoreServices/SystemVersion.plist"
-        _diag_ssh "SEP firmware on System volume (metadata only)" "ls -la /mnt1/usr/standalone/firmware/ | grep -i sep"
+    if [ -n "$xart_node" ]; then
+        _diag_ssh "mount -o rdonly $xart_node /mnt7 (xART)" "/sbin/mount_apfs -o rdonly $xart_node /mnt7"
+        [ "$ssh_connection_lost" = "1" ] && { _log_stop "SSH dropped during the xART mount - this is the exact point of failure."; return 255; }
+    else
+        _log_warn "No volume reported the xART role, so /mnt7 was not mounted."
     fi
+    diag_oneline=1
+    _diag_ssh "mounted APFS volumes" "/sbin/mount | grep -E '/mnt[0-9]'"
+    if [ "$sys_rc" -eq 0 ]; then
+        _diag_ssh "installed system version" "grep -A1 -E 'ProductVersion|ProductBuildVersion' /mnt1/System/Library/CoreServices/SystemVersion.plist"
+        _diag_ssh "SEP firmware on System volume (not used when /mnt6/active exists)" "ls -la /mnt1/usr/standalone/firmware/ 2>&1 | grep -i sep; exit 0"
+    fi
+    diag_oneline=0
     _diag_ssh "Preboot active slot" "cat /mnt6/active"
     local active="$diag_last_output"
     if [ "$diag_last_rc" -eq 0 ] && [ -n "$active" ]; then
-        _diag_ssh "SEP firmware under Preboot active slot (metadata only)" "ls -la /mnt6/$active/usr/standalone/firmware/ | grep -i sep"
+        diag_oneline=1
+        _diag_ssh "SEP firmware under Preboot slot (the file seputil --load uses)" "ls -la /mnt6/$active/usr/standalone/firmware/ | grep -i sep; exit 0"
+        diag_oneline=0
+        _diag_fetch_sep "$active"
     else
         _log_warn "No /mnt6/active - seputil --load would fall back to /mnt1/usr/standalone/firmware/sep-firmware.img4"
     fi
+    _diag_ssh "umount /mnt7" "/sbin/umount /mnt7 2>&1; exit 0"
     _diag_ssh "umount /mnt6" "/sbin/umount /mnt6"
     _diag_ssh "umount /mnt1" "/sbin/umount /mnt1"
     return 0
+}
+
+# Copies the (public Apple, personalised) sep-firmware.img4 to the host so its
+# IMG4 metadata can be read there. No keys, keybags or user data are involved.
+_diag_fetch_sep() {
+    local active="$1"
+    local sepfile="${diagnose_log%.log}_sep-firmware.img4"
+    if "$bin"/sshpass -p 'alpine' scp -o StrictHostKeyChecking=no -o ConnectTimeout=8 -P 2222 \
+        "root@localhost:/mnt6/$active/usr/standalone/firmware/sep-firmware.img4" "$sepfile" 2> /dev/null; then
+        local sum
+        if command -v shasum > /dev/null; then sum=$(shasum -a 256 "$sepfile" | cut -d' ' -f1); else sum=$(sha256sum "$sepfile" | cut -d' ' -f1); fi
+        _log_ok "copied sep-firmware.img4 to $sepfile ($(wc -c < "$sepfile" | tr -d ' ') bytes, sha256 $sum)"
+        if "$bin"/img4tool -a "$sepfile" > "${sepfile}.img4tool.txt" 2>&1; then
+            _log_info "img4tool metadata saved to ${sepfile}.img4tool.txt (not copied into this log; it contains the device ECID)"
+        else
+            _log_warn "img4tool could not parse the file (see ${sepfile}.img4tool.txt)"
+        fi
+    else
+        _log_warn "could not copy sep-firmware.img4 from /mnt6/$active"
+    fi
 }
 
 _run_diagnose() {
@@ -1965,107 +2013,75 @@ _run_diagnose() {
     diagnose_log="$dir"/logs/diagnose_${deviceid}_$(date -u +%Y%m%d_%H%M%S).log
     : > "$diagnose_log" 2>/dev/null
 
-    _log_info "Semaphorin --diagnose starting"
-    _log_info "Device: ${deviceid:-unknown} (model ${replace:-unknown}, CPID ${cpid:-unknown})"
-    _log_info "Target version: ${version:-unknown} | Currently-installed version (per prompt): ${r:-unknown}"
-    _log_info "Host OS: $os"
-    _log_info "Report file: $diagnose_log"
+    _log_info "Semaphorin --diagnose | $deviceid ($replace, CPID $cpid) | host $os"
+    _log_info "Target $version, installed (per prompt) ${r:-unknown} | report: $diagnose_log"
 
-    _log_info "Checking SSH ramdisk reachability"
     _diag_ssh "ssh reachability (echo)" "echo semaphorin_diag_ok"
     if [ "$ssh_connection_lost" = "1" ] || [[ "$diag_last_output" != *"semaphorin_diag_ok"* ]]; then
         _log_stop "Could not reach the SSH ramdisk (device may not have booted it, or iproxy/USB is not forwarding). Aborting diagnostics."
         return 1
     fi
-    _log_ok "SSH ramdisk is reachable"
-
-    _diag_ssh "uname -a" "uname -a"
-
-    _log_info "APFS inspection started (read-only; mount_filesystems is NOT called automatically)"
-    _diag_ssh "current mount table" "/sbin/mount"
-    [ "$ssh_connection_lost" = "1" ] && { _log_stop "Lost SSH while listing mounts"; return 1; }
-
-    _diag_ssh "raw disk device nodes" "ls -la /dev/ 2>/dev/null | grep -i disk"
-    [ "$ssh_connection_lost" = "1" ] && { _log_stop "Lost SSH while listing /dev disk nodes"; return 1; }
-
-    # The ramdisk's non-interactive PATH is minimal and mount_filesystems is a
-    # wrapper that may call tools by absolute path, so a `command -v` lookup
-    # gives false "not found" results. Scan the standard directories instead.
-    _diag_ssh "APFS/SEP-related executables in standard directories" \
-        "for d in /sbin /usr/sbin /usr/bin /usr/libexec /usr/local/bin /usr/local/sbin; do echo \"== \$d\"; ls -la \$d 2>/dev/null | grep -i -E 'apfs|seputil|sepos|mount|fsck|keybag'; done"
+    diag_oneline=1
+    _diag_ssh "ramdisk kernel" "uname -a"
+    _diag_ssh "ramdisk OS (sw_vers)" "/usr/bin/sw_vers"
+    _diag_ssh "mounted before any mount attempt" "/sbin/mount"
+    _diag_ssh "disk nodes" "ls /dev | grep -E '^disk'"
+    _diag_ssh "mountpoint directories" "ls -d /mnt1 /mnt2 /mnt6 /mnt7 2>&1"
+    _diag_ssh "key tools present" 'for f in /sbin/mount_apfs /usr/libexec/seputil /usr/bin/mount_filesystems /System/Library/Filesystems/apfs.fs/apfs.util; do [ -x $f ] && echo "$f=ok" || echo "$f=MISSING"; done'
+    _diag_ssh "mount_filesystems script" 'echo "size=$(wc -c < /usr/bin/mount_filesystems) seputil_calls=$(grep -c seputil /usr/bin/mount_filesystems)"'
+    _diag_ssh "sep-firmware/apticket already visible (read-only, -xdev)" \
+        "find / -xdev \\( -iname 'sep-firmware*' -o -iname 'apticket*' \\) 2>/dev/null; exit 0"
+    diag_oneline=0
     if [ "$ssh_connection_lost" = "1" ]; then
-        _log_stop "Lost SSH while scanning for APFS/SEP tools"
+        _log_stop "Lost SSH during the passive ramdisk checks"
         return 1
     fi
-    # Read-only: shows exactly which tools/paths the wrapper invokes.
-    _diag_ssh "contents of /usr/bin/mount_filesystems (read-only cat)" "cat /usr/bin/mount_filesystems"
-    if [ "$ssh_connection_lost" = "1" ]; then
-        _log_stop "Lost SSH while reading mount_filesystems"
-        return 1
-    fi
-    # Passive extras: which branch of mount_filesystems applies, whether the
-    # mountpoints it needs exist (ENOENT from mount_apfs can mean a missing
-    # mountpoint), and which APFS helpers the ramdisk ships.
-    _diag_ssh "ramdisk OS version (sw_vers)" "/usr/bin/sw_vers"
-    _diag_ssh "mountpoint directories" "ls -ld /mnt1 /mnt2 /mnt6 /mnt7"
-    _diag_ssh "apfs.fs helpers shipped in the ramdisk" "ls -la /System/Library/Filesystems/apfs.fs/"
-    if [ "$ssh_connection_lost" = "1" ]; then
-        _log_stop "Lost SSH during passive ramdisk checks"
-        return 1
-    fi
-    _log_info "APFS/SEP tool availability check complete (none of them were executed)"
 
-    _log_info "SEP firmware inspection started"
-    _log_info "Looking for sep-firmware/apticket on filesystems already mounted by the ramdisk itself (read-only, -xdev)"
-    _diag_ssh "search for sep-firmware on mounted filesystems" \
-        "find / -xdev \\( -iname 'sep-firmware*' -o -iname 'apticket*' \\) 2>/dev/null"
-    if [ "$ssh_connection_lost" = "1" ]; then
-        _log_stop "Lost SSH while searching for SEP firmware"
-        return 1
-    fi
-    if [ -n "$diag_last_output" ]; then
-        _log_ok "Found candidate SEP/apticket paths already visible: $diag_last_output"
-    else
-        _log_warn "No sep-firmware/apticket found on the filesystems that are already mounted. This is expected if /mnt1 (System) is not mounted yet - mounting it is what mount_filesystems/mount_apfs is for, and is NOT done automatically here."
+    if [[ "$diagnose_verbose" == 1 ]]; then
+        _log_info "--diagnose-verbose: full dumps follow"
+        _diag_ssh "APFS/SEP-related executables in standard directories" \
+            "for d in /sbin /usr/sbin /usr/bin /usr/libexec /usr/local/bin /usr/local/sbin; do echo \"== \$d\"; ls -la \$d 2>/dev/null | grep -i -E 'apfs|seputil|sepos|mount|fsck|keybag'; done; exit 0"
+        _diag_ssh "contents of /usr/bin/mount_filesystems (read-only cat)" "cat /usr/bin/mount_filesystems"
+        _diag_ssh "apfs.fs helpers shipped in the ramdisk" "ls -la /System/Library/Filesystems/apfs.fs/ | grep -v lproj"
+        if [ "$ssh_connection_lost" = "1" ]; then
+            _log_stop "Lost SSH during the verbose dumps"
+            return 1
+        fi
     fi
 
-    _log_info "Checking locally downloaded boot components for the selected ramdisk version ($r)"
-    local rd_dir="$dir/$deviceid/$cpid/ramdisk/$r"
+    local rd_dir="$dir/$deviceid/$cpid/ramdisk/$r" f sz comp=""
     if [ -d "$rd_dir" ]; then
         for f in iBSS.img4 iBEC.img4 kernelcache.img4 devicetree.img4 trustcache.img4 ramdisk.img4; do
             if [ -e "$rd_dir/$f" ]; then
-                local sz
                 sz=$(wc -c < "$rd_dir/$f" 2>/dev/null | tr -d ' ')
                 if [ "${sz:-0}" -eq 0 ]; then
                     _log_error "$f exists but is zero bytes (corrupt/truncated download) at $rd_dir/$f"
                 else
-                    _log_ok "$f present, $sz bytes"
+                    comp="$comp $f=$sz"
                 fi
             else
                 _log_warn "$f missing from $rd_dir (not fatal if this device/version doesn't need it)"
             fi
         done
+        _log_info "local ramdisk components ($r):$comp"
     else
         _log_warn "Expected ramdisk component directory not found: $rd_dir"
     fi
 
-    _log_info "Checking previously backed-up SEP/activation material under $dir/$deviceid/0.0"
-    local bk_dir="$dir/$deviceid/0.0"
+    local bk_dir="$dir/$deviceid/0.0" bk=""
     for f in apticket.der sep-firmware.img4 keybags; do
-        if [ -e "$bk_dir/$f" ]; then
-            _log_ok "$f already backed up at $bk_dir/$f ($(date -r "$bk_dir/$f" -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || stat -c %y "$bk_dir/$f" 2>/dev/null))"
-        else
-            _log_info "$f not yet backed up locally (would be fetched by --restore after mount_filesystems succeeds)"
-        fi
+        if [ -e "$bk_dir/$f" ]; then bk="$bk $f=yes"; else bk="$bk $f=no"; fi
     done
+    _log_info "already backed up under $bk_dir:$bk"
 
     if [[ "$diagnose_apfs_ro" == 1 ]]; then
         _diag_apfs_ro_test
     fi
     if [[ "$diagnose_mount_test" == 1 ]]; then
         _diag_mount_test
-    else
-        _log_info "Skipping live mount_filesystems test (pass --diagnose-mount-test to run it explicitly)"
+    fi
+    if [[ "$diagnose_apfs_ro" != 1 && "$diagnose_mount_test" != 1 ]]; then
+        _log_info "No mount stage requested (add --diagnose-apfs-ro, the safe read-only one, or --diagnose-mount-test)"
     fi
 
     if [ "$ssh_connection_lost" = "1" ]; then

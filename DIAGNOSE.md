@@ -413,3 +413,40 @@ APFS failure, not a SEP failure. Not yet run on hardware.
   on a real drop, logs the USB mode 1/3/6 s later (`ramdisk` = kernel still
   up, `recovery`/`dfu` = device reset, `none` = USB gone). This is the
   first mechanism in this repo that can tell a panic/reset from a SEP error.
+
+## 12. Second real-hardware run (iPhone10,6, 14.3 ramdisk, `--diagnose-apfs-ro`)
+
+### Facts (observed)
+- The "SSH connection lost" in the previous run was a **false positive of the
+  tool**: `apfs.util -p` always exits 255 (it prints the role and returns -1).
+  With the liveness probe the link was alive for all seven calls.
+- APFS volume roles: `s1=System s2=Data s3=xART s4=Baseband Data s5=Hardware
+  s6=Preboot s7=Update`. The slots `mount_filesystems` hard-codes (System=s1,
+  Data=s2) are correct on this device, and Preboot/xART are found by role, so
+  **a changed volume order is ruled out**.
+- `mount_apfs -o rdonly` of System (`/dev/disk0s1s1`, "sealed") and Preboot
+  (`/dev/disk0s1s6`) both **succeeded**, with no ENOENT and no SSH loss.
+- System volume `SystemVersion.plist`: 14.3 (18C66), matching the ramdisk.
+- `/mnt6/active` exists, so `seputil --load` uses
+  `/mnt6/<active>/usr/standalone/firmware/sep-firmware.img4`: a 1,415,361-byte
+  file with an mtime of the same day as the surrealra1n restore. The System
+  volume itself has no `sep-firmware` under `/usr/standalone/firmware`.
+- Missing mountpoints are ruled out (all four exist).
+
+### What this changes
+- The earlier "volume order / hard-coded slot" hypothesis is not supported.
+- `mount_apfs` itself works read-only, so the original
+  `mount_apfs: ... No such file or directory` comes from something this run
+  did **not** do: a mount without `-o rdonly` of the sealed System volume,
+  the xART mount, or the Data volume mount (which `mount_filesystems` runs
+  last, after `seputil --load`). `--diagnose-apfs-ro` now also mounts xART
+  read-only to test that candidate. Still untested: `seputil --gigalocker-init`
+  and `seputil --load`, the two steps that involve the SEP.
+
+### Log size
+Default `--diagnose` logs are now compact (about 25 lines instead of 300):
+roles, tool presence and listings are single summary lines. The full dumps
+(`mount_filesystems` source, directory scans, apfs.fs listing) moved behind
+`--diagnose-verbose`. The SEP firmware copied for inspection and the
+`img4tool` output are stored next to the log and are not written into it
+(the latter contains the device ECID).
