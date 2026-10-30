@@ -10,6 +10,11 @@ maj_ver=$(echo "$os_ver" | awk -F. '{print $1}')
 dir="$(pwd)"
 bin="$(pwd)/$(uname)"
 sshtars="$(pwd)/sshtars"
+# Re-assert the executable bit on the bundled tools/scripts. Some
+# distribution methods (zip downloads, certain git/CI checkouts) don't
+# preserve it, which otherwise shows up as "Permission denied" the first
+# time this script shells out to one of them.
+chmod +x "$bin"/* "$dir"/jb/*.sh "$0" 2>/dev/null
 echo "Semaphorin | Version 1.0"
 echo "Written by y08wilm and Mineek | Some code and ramdisk from Nathan"
 echo ""
