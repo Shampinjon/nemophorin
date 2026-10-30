@@ -173,6 +173,8 @@ Main operation mode:
     --fix-auto-boot            Fixes booting into the main OS on A11 devices such as the iPhone X
     --diagnose                 Safe, read-only diagnostic mode: boots the SSH ramdisk and inspects
                                 APFS/SEP state without mounting, wiping, or restoring anything
+    --update                   Check for a newer version, update without asking, then exit
+    --no-update-check          Skip the startup check for a newer version
     --diagnose-apfs-ro         With --diagnose: probes APFS volume roles and mounts System/Preboot
                                 strictly read-only (no xART, gigalocker, seputil or Data volume) to
                                 separate an APFS mount failure from a SEP failure. Needs YES.
@@ -316,6 +318,9 @@ parse_opt() {
             ;;
         --diagnose-apfs-ro)
             diagnose_apfs_ro=1
+            ;;
+        --update|--no-update-check)
+            # handled by _check_for_updates before the device is touched
             ;;
         --dump-blobs)
             dump_blobs=1
@@ -2180,6 +2185,138 @@ _boot_ramdisk() {
         _boot_ramdisk2
     fi
 }
+# --- update check -----------------------------------------------------------
+# A public repository needs no credentials. If it is private, updates need a git
+# checkout (uses the invoking user's git login) or a read-only GitHub token in
+# $SEMAPHORIN_GITHUB_TOKEN or $dir/.update_token.
+# Skip with --no-update-check or SEMAPHORIN_SKIP_UPDATE=1.
+update_repo="Shampinjon/nemophorin"
+update_branch="main"
+_as_user() {
+    # git credentials (keychain) belong to the user, not to root under sudo
+    if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+        sudo -u "$SUDO_USER" env GIT_TERMINAL_PROMPT=0 "$@"
+    else
+        env GIT_TERMINAL_PROMPT=0 "$@"
+    fi
+}
+_update_token() {
+    if [ -n "$SEMAPHORIN_GITHUB_TOKEN" ]; then
+        echo "$SEMAPHORIN_GITHUB_TOKEN"
+    elif [ -r "$dir/.update_token" ]; then
+        head -n 1 "$dir/.update_token" | tr -d '[:space:]'
+    fi
+}
+_update_curl() {
+    # token goes in via stdin so it never shows up in `ps`
+    local tok
+    tok=$(_update_token)
+    if [ -n "$tok" ]; then
+        printf 'header = "Authorization: Bearer %s"\n' "$tok" | curl -K - -fsSL --max-time 20 "$@"
+    else
+        curl -fsSL --max-time 20 "$@"
+    fi
+}
+_remote_sha() {
+    if [ -d "$dir/.git" ]; then
+        _as_user git -C "$dir" ls-remote origin "refs/heads/$update_branch" 2>/dev/null | awk '{print $1}'
+    else
+        # works without a token once the repository is public
+        _update_curl --max-time 8 -H "Accept: application/vnd.github.sha" \
+            "https://api.github.com/repos/$update_repo/commits/$update_branch" 2>/dev/null
+    fi
+}
+_local_sha() {
+    if [ -d "$dir/.git" ]; then
+        _as_user git -C "$dir" rev-parse HEAD 2>/dev/null
+    elif [ -r "$dir/.installed_sha" ]; then
+        head -n 1 "$dir/.installed_sha"
+    fi
+}
+_do_update() {
+    local new_sha="$1" tmp src d
+    if [ -d "$dir/.git" ]; then
+        _as_user git -C "$dir" pull --ff-only origin "$update_branch" || {
+            echo "[-] git pull failed (local changes?). Resolve it manually with git."
+            return 1
+        }
+        return 0
+    fi
+    tmp=$(mktemp -d) || return 1
+    if ! _update_curl -o "$tmp/src.zip" "https://api.github.com/repos/$update_repo/zipball/$update_branch" \
+        || ! unzip -q "$tmp/src.zip" -d "$tmp/x"; then
+        rm -rf "$tmp"
+        return 1
+    fi
+    src=""
+    for d in "$tmp"/x/*/; do src="$d"; break; done
+    if [ -z "$src" ] || [ ! -f "${src}semaphorin.sh" ]; then
+        echo "[-] Downloaded archive does not look like Semaphorin; not applying it."
+        rm -rf "$tmp"
+        return 1
+    fi
+    # Only overwrites files that exist in the repo; your logs/, device folders,
+    # downloaded ramdisks and java/ are not in the archive and stay untouched.
+    cp -Rf "${src}." "$dir"/ || { rm -rf "$tmp"; return 1; }
+    echo "$new_sha" > "$dir/.installed_sha"
+    rm -rf "$tmp"
+}
+_check_for_updates() {
+    [ "$SEMAPHORIN_UPDATED" = "1" ] && return 0
+    local force=0 skip=0 a remote local_sha ans
+    for a in "$@"; do
+        [ "$a" = "--update" ] && force=1
+        [ "$a" = "--no-update-check" ] && skip=1
+    done
+    [ "$SEMAPHORIN_SKIP_UPDATE" = "1" ] && skip=1
+    [ "$force" = "0" ] && [ "$skip" = "1" ] && return 0
+    remote=$(_remote_sha)
+    if [ -z "$remote" ]; then
+        if [ ! -d "$dir/.git" ] && [ -z "$(_update_token)" ]; then
+            echo "[i] Update check skipped: could not reach the repository. If it is private, use 'git clone' (updates then use your git login) or put a read-only GitHub token in $dir/.update_token."
+        else
+            echo "[i] Update check skipped: could not reach GitHub."
+        fi
+        [ "$force" = "1" ] && exit 1
+        return 0
+    fi
+    local_sha=$(_local_sha)
+    # git checkout that is ahead of origin (unpushed commits): not outdated
+    if [ "$remote" != "$local_sha" ] && [ -d "$dir/.git" ] \
+        && _as_user git -C "$dir" merge-base --is-ancestor "$remote" HEAD 2>/dev/null; then
+        local_sha="$remote"
+    fi
+    if [ "$remote" = "$local_sha" ]; then
+        echo "[*] Semaphorin is up to date (${remote:0:7})."
+        [ "$force" = "1" ] && exit 0
+        return 0
+    fi
+    if [ -n "$local_sha" ]; then
+        echo "[*] A newer version is available: ${local_sha:0:7} -> ${remote:0:7}"
+    else
+        echo "[*] Latest version is ${remote:0:7}; the installed version is unknown."
+    fi
+    if [ "$force" = "0" ]; then
+        if [ -t 0 ]; then
+            read -r -p "[?] Update now? [Y/n] " ans
+            case "$ans" in n|N|no|NO) echo "[*] Skipping the update."; return 0;; esac
+        else
+            echo "[i] Not interactive, so not updating. Run with --update to update."
+            return 0
+        fi
+    fi
+    if _do_update "$remote"; then
+        echo "[*] Updated to ${remote:0:7}."
+        [ "$force" = "1" ] && exit 0
+        export SEMAPHORIN_UPDATED=1
+        exec bash "$dir/semaphorin.sh" "$@"
+    fi
+    echo "[-] Update failed; continuing with the current version."
+    [ "$force" = "1" ] && exit 1
+    return 0
+}
+_check_for_updates "$@"
+# --- end update check ------------------------------------------------------
 if [ ! -e java/bin/java ]; then
     mkdir java
     cd java

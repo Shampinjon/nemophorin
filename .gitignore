@@ -97,3 +97,5 @@ NoMoreSIGABRT*
 # system iproxy symlinked in by semaphorin.sh at startup
 Darwin/iproxy
 Linux/iproxy
+.update_token
+.installed_sha
