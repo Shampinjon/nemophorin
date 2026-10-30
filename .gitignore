@@ -1,0 +1,95 @@
+# Device files
+iP*
+
+# Dump files
+dump.raw
+dumped.shsh
+
+# Compressed and package files
+cctools-*.tar.gz
+libssl-dev_*.deb
+libssl1.1_*.deb
+work.tar.gz
+
+# iOS restore files
+*.ipsw
+iPhone_*.ipsw
+RestoreRamDisk*
+
+# Checkra1n and firmware
+checkra1n-kpf-pongo
+kernelcache*
+sep-firmware*
+kc*.bpatch
+kcache*
+*.dmg
+trustcache*
+
+# Specific raw and dec files
+*.raw
+*.dec
+
+# PLists and manifests
+Info.plist*
+BuildManifest.plist
+data_ark.plist
+DeviceTree*
+devicetree*
+Restore.plist
+SystemVersion.plist*
+
+# Directories
+Darwin/.compiled
+java/
+logs
+media/
+target
+wireless
+local
+firmware
+FUD
+
+# Misc files
+Carrier_Bundles.tar
+IM4M
+activation_records
+apticket.der
+keybags
+Baseband
+work
+work2
+mnt*.*
+mnt*.tar
+mnt*-done.tar
+disk0*
+containermanagerd.*
+com.apple.commcenter*
+com.apple.factorydata
+com.apple.datamigrator*
+lockdownd.*
+securityd.*
+mobactivationd.*
+
+# Cache and temporary files
+dyld_shared_cache_arm64.*
+*.swp
+.DS_Store
+
+# Specific firmware components
+avefw.*
+aopfw.*
+ispfw.*
+homerfw.*
+multitouch.*
+audiocodecfirmware.*
+kpp.bin
+
+# iOS versions and beta files
+ios7*
+ios8*
+OS*
+beta2*
+full*
+
+# NoMoreSIGABRT related files
+NoMoreSIGABRT*
