@@ -93,3 +93,7 @@ full*
 
 # NoMoreSIGABRT related files
 NoMoreSIGABRT*
+
+# system iproxy symlinked in by semaphorin.sh at startup
+Darwin/iproxy
+Linux/iproxy

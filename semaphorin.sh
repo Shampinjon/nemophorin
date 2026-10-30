@@ -15,6 +15,29 @@ sshtars="$(pwd)/sshtars"
 # preserve it, which otherwise shows up as "Permission denied" the first
 # time this script shells out to one of them.
 chmod +x "$bin"/* "$dir"/jb/*.sh "$0" 2>/dev/null
+# iproxy is not bundled in $bin. Link in the system one (libimobiledevice) if
+# present. PATH is often reduced under sudo, so also look in the usual
+# Homebrew/package locations.
+if [ ! -x "$bin"/iproxy ]; then
+    for p in "$(command -v iproxy 2>/dev/null)" /opt/homebrew/bin/iproxy /usr/local/bin/iproxy /usr/bin/iproxy; do
+        if [ -n "$p" ] && [ -x "$p" ]; then
+            ln -sf "$p" "$bin"/iproxy
+            break
+        fi
+    done
+fi
+# Modes that talk to the SSH ramdisk need iproxy; fail now, before the user is
+# walked through DFU, rather than after.
+if [[ "$*" =~ --(ramdisk|restore|diagnose|dump-blobs|dump-nand|restore-[a-z0-9]+|ssh|NoMoreSIGABRT|disable-NoMoreSIGABRT|force-activation) ]] && [ ! -x "$bin"/iproxy ]; then
+    echo "[-] iproxy was not found (not bundled in $bin, and not installed on this system)." >&2
+    if [ "$os" = "Darwin" ]; then
+        echo "[-] Install it with:  brew install libimobiledevice usbmuxd" >&2
+    else
+        echo "[-] Install it with:  sudo apt install libimobiledevice-utils   (or your distro's equivalent)" >&2
+    fi
+    echo "[-] Then run this command again. Nothing was done to the device." >&2
+    exit 1
+fi
 echo "Semaphorin | Version 1.0"
 echo "Written by y08wilm and Mineek | Some code and ramdisk from Nathan"
 echo ""
