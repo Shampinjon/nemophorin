@@ -444,9 +444,8 @@ APFS failure, not a SEP failure. Not yet run on hardware.
   and `seputil --load`, the two steps that involve the SEP.
 
 ### Log size
-Default `--diagnose` logs are now compact (about 25 lines instead of 300):
-roles, tool presence and listings are single summary lines. The full dumps
-(`mount_filesystems` source, directory scans, apfs.fs listing) moved behind
-`--diagnose-verbose`. The SEP firmware copied for inspection and the
-`img4tool` output are stored next to the log and are not written into it
-(the latter contains the device ECID).
+Full logs are the default (mount_filesystems source, directory scans, apfs.fs
+listing, whole SystemVersion.plist). `--diagnose-compact` folds them into
+summary lines (about 25 lines instead of 300). The SEP firmware copied for
+inspection and the `img4tool` output are stored next to the log and are not
+written into it (the latter contains the device ECID).

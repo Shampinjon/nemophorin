@@ -175,8 +175,8 @@ Main operation mode:
                                 APFS/SEP state without mounting, wiping, or restoring anything
     --update                   Check for a newer version, update without asking, then exit
     --no-update-check          Skip the startup check for a newer version
-    --diagnose-verbose         With --diagnose: also dump the full mount_filesystems script, tool
-                                directory scans and the apfs.fs listing (log is compact otherwise)
+    --diagnose-compact         With --diagnose: short one-line summaries instead of the full dumps
+                                (mount_filesystems source, directory scans, apfs.fs listing)
     --diagnose-apfs-ro         With --diagnose: probes APFS volume roles and mounts System/Preboot
                                 strictly read-only (no xART, gigalocker, seputil or Data volume) to
                                 separate an APFS mount failure from a SEP failure. Needs YES.
@@ -329,8 +329,11 @@ parse_opt() {
         --diagnose-apfs-ro)
             diagnose_apfs_ro=1
             ;;
+        --diagnose-compact)
+            diagnose_compact=1
+            ;;
         --diagnose-verbose)
-            diagnose_verbose=1
+            # full dumps are the default now; kept so old command lines still work
             ;;
         --update|--no-update-check)
             # handled by _check_for_updates before the device is touched
@@ -1965,10 +1968,14 @@ _diag_apfs_ro_test() {
     else
         _log_warn "No volume reported the xART role, so /mnt7 was not mounted."
     fi
-    diag_oneline=1
+    diag_oneline=$diag_ol
     _diag_ssh "mounted APFS volumes" "/sbin/mount | grep -E '/mnt[0-9]'"
     if [ "$sys_rc" -eq 0 ]; then
-        _diag_ssh "installed system version" "grep -A1 -E 'ProductVersion|ProductBuildVersion' /mnt1/System/Library/CoreServices/SystemVersion.plist"
+        if [ "$diag_ol" = "1" ]; then
+            _diag_ssh "installed system version" "grep -A1 -E 'ProductVersion|ProductBuildVersion' /mnt1/System/Library/CoreServices/SystemVersion.plist"
+        else
+            _diag_ssh "installed system version (SystemVersion.plist)" "cat /mnt1/System/Library/CoreServices/SystemVersion.plist"
+        fi
         _diag_ssh "SEP firmware on System volume (not used when /mnt6/active exists)" "ls -la /mnt1/usr/standalone/firmware/ 2>&1 | grep -i sep; exit 0"
     fi
     diag_oneline=0
@@ -2021,11 +2028,18 @@ _run_diagnose() {
         _log_stop "Could not reach the SSH ramdisk (device may not have booted it, or iproxy/USB is not forwarding). Aborting diagnostics."
         return 1
     fi
-    diag_oneline=1
+    # full output by default; --diagnose-compact folds it into summary lines
+    diag_ol=0
+    [ "$diagnose_compact" = "1" ] && diag_ol=1
+    diag_oneline=$diag_ol
     _diag_ssh "ramdisk kernel" "uname -a"
     _diag_ssh "ramdisk OS (sw_vers)" "/usr/bin/sw_vers"
     _diag_ssh "mounted before any mount attempt" "/sbin/mount"
-    _diag_ssh "disk nodes" "ls /dev | grep -E '^disk'"
+    if [ "$diag_ol" = "1" ]; then
+        _diag_ssh "disk nodes" "ls /dev | grep -E '^disk'"
+    else
+        _diag_ssh "disk nodes" "ls -la /dev | grep -i disk"
+    fi
     _diag_ssh "mountpoint directories" "ls -d /mnt1 /mnt2 /mnt6 /mnt7 2>&1"
     _diag_ssh "key tools present" 'for f in /sbin/mount_apfs /usr/libexec/seputil /usr/bin/mount_filesystems /System/Library/Filesystems/apfs.fs/apfs.util; do [ -x $f ] && echo "$f=ok" || echo "$f=MISSING"; done'
     _diag_ssh "mount_filesystems script" 'echo "size=$(wc -c < /usr/bin/mount_filesystems) seputil_calls=$(grep -c seputil /usr/bin/mount_filesystems)"'
@@ -2037,8 +2051,8 @@ _run_diagnose() {
         return 1
     fi
 
-    if [[ "$diagnose_verbose" == 1 ]]; then
-        _log_info "--diagnose-verbose: full dumps follow"
+    if [[ "$diagnose_compact" != 1 ]]; then
+        _log_info "full dumps follow (use --diagnose-compact for a short log)"
         _diag_ssh "APFS/SEP-related executables in standard directories" \
             "for d in /sbin /usr/sbin /usr/bin /usr/libexec /usr/local/bin /usr/local/sbin; do echo \"== \$d\"; ls -la \$d 2>/dev/null | grep -i -E 'apfs|seputil|sepos|mount|fsck|keybag'; done; exit 0"
         _diag_ssh "contents of /usr/bin/mount_filesystems (read-only cat)" "cat /usr/bin/mount_filesystems"
