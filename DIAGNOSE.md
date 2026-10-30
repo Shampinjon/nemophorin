@@ -337,3 +337,65 @@ diff, same file layout fetched:
    belongs in which ramdisk/SEP-firmware version Semaphorin selects for
    this specific post-tethered-downgrade state - not in forcing `seputil`
    to proceed past an error.
+
+## 11. Findings from real hardware (iPhone10,6 / D221AP, 14.3 SSH ramdisk)
+
+Source: `logs/diagnose_iPhone10,6_*.log` from a `--diagnose` run on a physical
+device (read-only; `mount_filesystems` was not run). Facts first, then
+hypotheses, clearly separated.
+
+### Facts (observed)
+- The SSH ramdisk is stable; no link loss during the passive checks. Ramdisk
+  kernel is `xnu-7195.62.1` (iOS 14.3), `RELEASE_ARM64_T8015`.
+- Only `/` (hfs, read-only) and `/dev` are mounted before any mount attempt.
+- Block devices: `disk0`, `disk0s1`, `disk0s1s1`..`disk0s1s7` (7 APFS
+  volumes), plus `disk1`, `disk2`. There are no `disk1sN` nodes, so the
+  volumes are addressed as `disk0s1sN`.
+- `/usr/bin/mount_filesystems` is a 3820-byte **bash script**, not a binary.
+  It calls `/sbin/mount_apfs` (symlink into
+  `/System/Library/Filesystems/apfs.fs/`), `apfs.util` and
+  `/usr/libexec/seputil` (171760 bytes) by absolute path. An earlier
+  PATH-based lookup that reported them "not found" was wrong.
+
+### What `mount_filesystems` does on a non-16/17 ramdisk
+1. `mount_apfs /dev/disk0s1s1 /mnt1` - **System is assumed to be slot 1**.
+2. For slots 3-7, `apfs.util -p` is used to find `Preboot` (mounted at
+   `/mnt6`) and `xART` (mounted at `/mnt7`, followed by
+   `seputil --gigalocker-init`).
+3. `seputil --load` the SEP firmware from
+   `/mnt6/$(cat /mnt6/active)/usr/standalone/firmware/sep-firmware.img4` if
+   `/mnt6/active` exists, otherwise from
+   `/mnt1/usr/standalone/firmware/sep-firmware.img4`.
+4. `mount_apfs /dev/disk0s1s2 /mnt2` - **Data is assumed to be slot 2**.
+
+There is no `set -e`: every step runs even if an earlier one failed. This
+answers where `seputil` gets `sep-firmware.img4`: from the **installed OS's**
+Preboot/System volume, i.e. whatever SEP firmware the device currently has
+on disk, not from the ramdisk.
+
+### Hypotheses (not yet verified)
+- Slots 1 (System) and 2 (Data) are hard-coded, while only Preboot/xART are
+  detected by role. After a tethered downgrade the volume order may differ.
+  `--diagnose-apfs-ro` prints the role of all seven slots to check this.
+- `mount_apfs: ... No such file or directory` is a single failing mount;
+  which one is unknown. A missing mountpoint directory is one candidate
+  (the passive diagnose now lists `/mnt1 /mnt2 /mnt6 /mnt7`). If System fails
+  and `/mnt6/active` is absent, `seputil --load` is pointed at a path on an
+  unmounted volume, which would explain "failed to load .../sep-firmware.img4".
+- From memory of `IOReturn.h` (please verify), `0xe00002d5` is
+  `kIOReturnBusy`, which would suggest the SEP was already loaded/started in
+  that boot rather than a bad image. Cheap test: boot a fresh ramdisk and run
+  the load only once.
+- The SEP firmware found on disk may belong to a different OS generation than
+  the 14.3 ramdisk kernel after the tethered downgrade. The new stage prints
+  `SystemVersion.plist` and the `sep-firmware` file metadata to compare.
+
+### New opt-in stage: `--diagnose-apfs-ro`
+```
+sudo ./semaphorin.sh 11.3 --diagnose --diagnose-apfs-ro
+```
+After a typed `YES`: runs `apfs.util -p` on slots 1-7, mounts System and
+Preboot **read-only**, prints `SystemVersion.plist`, the `/mnt6/active` slot
+and the `sep-firmware` file metadata, then unmounts. It never mounts xART or
+Data and never runs `gigalocker-init` or `seputil`, so a failure here is an
+APFS failure, not a SEP failure. Not yet run on hardware.

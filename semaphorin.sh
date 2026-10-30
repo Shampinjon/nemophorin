@@ -173,6 +173,9 @@ Main operation mode:
     --fix-auto-boot            Fixes booting into the main OS on A11 devices such as the iPhone X
     --diagnose                 Safe, read-only diagnostic mode: boots the SSH ramdisk and inspects
                                 APFS/SEP state without mounting, wiping, or restoring anything
+    --diagnose-apfs-ro         With --diagnose: probes APFS volume roles and mounts System/Preboot
+                                strictly read-only (no xART, gigalocker, seputil or Data volume) to
+                                separate an APFS mount failure from a SEP failure. Needs YES.
     --diagnose-mount-test      With --diagnose: explicitly also attempts a real mount_filesystems
                                 call (with full, non-redirected output) to see exactly how/where it
                                 fails. Risky - requires typed confirmation. Never auto-loads SEP fw.
@@ -286,6 +289,9 @@ parse_opt() {
             ;;
         --diagnose-mount-test)
             diagnose_mount_test=1
+            ;;
+        --diagnose-apfs-ro)
+            diagnose_apfs_ro=1
             ;;
         --dump-blobs)
             dump_blobs=1
@@ -1878,6 +1884,53 @@ _diag_mount_test() {
     return 0
 }
 
+_diag_apfs_ro_test() {
+    _log_warn "--diagnose-apfs-ro: probes APFS volume roles and mounts System and Preboot READ-ONLY."
+    _log_warn "It does NOT mount xART or the Data volume and does NOT run gigalocker-init or seputil,"
+    _log_warn "so the SEP is not involved. A mount_apfs crash could still drop the SSH link."
+    read -p "Type YES (all caps) to proceed with the read-only APFS test: " confirm
+    if [[ "$confirm" != "YES" ]]; then
+        _log_info "Read-only APFS test declined by user. Skipping."
+        return 0
+    fi
+    local util="/System/Library/Filesystems/apfs.fs/apfs.util"
+    local preboot_node=""
+    _log_info "APFS role probe (apfs.util -p, the same probe mount_filesystems itself runs first)"
+    for n in 1 2 3 4 5 6 7; do
+        _diag_ssh "role of /dev/disk0s1s$n" "$util -p /dev/disk0s1s$n"
+        [ "$ssh_connection_lost" = "1" ] && return 255
+        if [[ "$diag_last_output" == *"Preboot"* && -z "$preboot_node" ]]; then
+            preboot_node="/dev/disk0s1s$n"
+        fi
+    done
+    _log_info "Mounting System (/dev/disk0s1s1, the node mount_filesystems assumes) read-only at /mnt1"
+    _diag_ssh "mount_apfs -o rdonly /dev/disk0s1s1 /mnt1" "/sbin/mount_apfs -o rdonly /dev/disk0s1s1 /mnt1"
+    [ "$ssh_connection_lost" = "1" ] && { _log_stop "SSH dropped during the System mount - this is the exact point of failure."; return 255; }
+    local sys_rc=$diag_last_rc
+    if [ -n "$preboot_node" ]; then
+        _log_info "Mounting Preboot ($preboot_node) read-only at /mnt6"
+        _diag_ssh "mount_apfs -o rdonly $preboot_node /mnt6" "/sbin/mount_apfs -o rdonly $preboot_node /mnt6"
+        [ "$ssh_connection_lost" = "1" ] && { _log_stop "SSH dropped during the Preboot mount - this is the exact point of failure."; return 255; }
+    else
+        _log_warn "No volume reported the Preboot role, so /mnt6 was not mounted."
+    fi
+    _diag_ssh "mount table after read-only mounts" "/sbin/mount"
+    if [ "$sys_rc" -eq 0 ]; then
+        _diag_ssh "installed system version (SystemVersion.plist)" "cat /mnt1/System/Library/CoreServices/SystemVersion.plist"
+        _diag_ssh "SEP firmware on System volume (metadata only)" "ls -la /mnt1/usr/standalone/firmware/ | grep -i sep"
+    fi
+    _diag_ssh "Preboot active slot" "cat /mnt6/active"
+    local active="$diag_last_output"
+    if [ "$diag_last_rc" -eq 0 ] && [ -n "$active" ]; then
+        _diag_ssh "SEP firmware under Preboot active slot (metadata only)" "ls -la /mnt6/$active/usr/standalone/firmware/ | grep -i sep"
+    else
+        _log_warn "No /mnt6/active - seputil --load would fall back to /mnt1/usr/standalone/firmware/sep-firmware.img4"
+    fi
+    _diag_ssh "umount /mnt6" "/sbin/umount /mnt6"
+    _diag_ssh "umount /mnt1" "/sbin/umount /mnt1"
+    return 0
+}
+
 _run_diagnose() {
     mkdir -p "$dir"/logs
     diagnose_log="$dir"/logs/diagnose_${deviceid}_$(date -u +%Y%m%d_%H%M%S).log
@@ -1919,6 +1972,16 @@ _run_diagnose() {
     _diag_ssh "contents of /usr/bin/mount_filesystems (read-only cat)" "cat /usr/bin/mount_filesystems"
     if [ "$ssh_connection_lost" = "1" ]; then
         _log_stop "Lost SSH while reading mount_filesystems"
+        return 1
+    fi
+    # Passive extras: which branch of mount_filesystems applies, whether the
+    # mountpoints it needs exist (ENOENT from mount_apfs can mean a missing
+    # mountpoint), and which APFS helpers the ramdisk ships.
+    _diag_ssh "ramdisk OS version (sw_vers)" "/usr/bin/sw_vers"
+    _diag_ssh "mountpoint directories" "ls -ld /mnt1 /mnt2 /mnt6 /mnt7"
+    _diag_ssh "apfs.fs helpers shipped in the ramdisk" "ls -la /System/Library/Filesystems/apfs.fs/"
+    if [ "$ssh_connection_lost" = "1" ]; then
+        _log_stop "Lost SSH during passive ramdisk checks"
         return 1
     fi
     _log_info "APFS/SEP tool availability check complete (none of them were executed)"
@@ -1967,6 +2030,9 @@ _run_diagnose() {
         fi
     done
 
+    if [[ "$diagnose_apfs_ro" == 1 ]]; then
+        _diag_apfs_ro_test
+    fi
     if [[ "$diagnose_mount_test" == 1 ]]; then
         _diag_mount_test
     else
