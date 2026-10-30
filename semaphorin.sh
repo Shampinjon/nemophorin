@@ -143,6 +143,11 @@ Main operation mode:
     --clean                    Delete all the created boot files for your device
     --force-activation         Forces FactoryActivation on your device during restore
     --fix-auto-boot            Fixes booting into the main OS on A11 devices such as the iPhone X
+    --diagnose                 Safe, read-only diagnostic mode: boots the SSH ramdisk and inspects
+                                APFS/SEP state without mounting, wiping, or restoring anything
+    --diagnose-mount-test      With --diagnose: explicitly also attempts a real mount_filesystems
+                                call (with full, non-redirected output) to see exactly how/where it
+                                fails. Risky - requires typed confirmation. Never auto-loads SEP fw.
 
 The iOS version argument should be the iOS version you are downgrading to.
 EOF
@@ -150,6 +155,96 @@ EOF
 remote_cmd() {
     "$bin"/sshpass -p 'alpine' ssh -o StrictHostKeyChecking=no -p2222 root@localhost "$@"
 }
+
+# ---------------------------------------------------------------------------
+# Diagnostic logging helpers (used by --diagnose and by the hardened backup
+# step in the --restore flow). Never pass keybag/key material or activation
+# secrets to these - they are written to disk under logs/.
+# ---------------------------------------------------------------------------
+diagnose_log=""
+ssh_connection_lost=0
+_log_ts() {
+    date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+_log() {
+    local level="$1"; shift
+    local line="[$(_log_ts)] [$level] $*"
+    echo "$line"
+    if [ -n "$diagnose_log" ]; then
+        echo "$line" >> "$diagnose_log" 2>/dev/null
+    fi
+}
+_log_info()  { _log "INFO"  "$@"; }
+_log_ok()    { _log "OK"    "$@"; }
+_log_warn()  { _log "WARN"  "$@"; }
+_log_error() { _log "ERROR" "$@"; }
+_log_stop()  { _log "STOP"  "$@"; }
+
+# _diag_ssh <description> <remote command...>
+# Runs a remote command with a connect timeout and keepalive so a dead
+# USB/SSH link is detected instead of hanging forever. Captures combined
+# stdout+stderr and the exit code, logs the outcome, and on SSH-level
+# failure (exit 255 = connection error, as opposed to the remote command
+# itself returning non-zero) sets ssh_connection_lost=1 so callers can stop
+# instead of ploughing ahead with a dead link.
+_diag_ssh() {
+    local desc="$1"; shift
+    local out rc
+    out=$("$bin"/sshpass -p 'alpine' ssh \
+        -o StrictHostKeyChecking=no \
+        -o ConnectTimeout=8 \
+        -o ServerAliveInterval=3 \
+        -o ServerAliveCountMax=2 \
+        -p2222 root@localhost "$@" 2>&1)
+    rc=$?
+    diag_last_output="$out"
+    diag_last_rc=$rc
+    if [ "$rc" -eq 255 ]; then
+        ssh_connection_lost=1
+        _log_stop "SSH connection lost during: $desc"
+        [ -n "$out" ] && _log_error "Last output before disconnect: $out"
+        return 255
+    elif [ "$rc" -ne 0 ]; then
+        _log_warn "$desc (exit $rc)"
+        [ -n "$out" ] && _log_warn "output: $out"
+    else
+        _log_ok "$desc"
+        [ -n "$out" ] && _log_info "output: $out"
+    fi
+    return "$rc"
+}
+
+# _remote_path_exists <path> - read-only existence check over SSH.
+# Returns 0 if the path exists, 1 if it does not, 255 if the SSH link died.
+_remote_path_exists() {
+    local path="$1"
+    _diag_ssh "check remote path exists: $path" \
+        "test -e '$path' && echo __SEMAPHORIN_EXISTS__ || echo __SEMAPHORIN_MISSING__"
+    local rc=$?
+    if [ "$rc" -eq 255 ]; then
+        return 255
+    fi
+    if [[ "$diag_last_output" == *"__SEMAPHORIN_EXISTS__"* ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# _remote_is_mounted <mountpoint> - checks the *current* mount table over
+# SSH (read-only `mount`), instead of assuming a prior mount call worked.
+_remote_is_mounted() {
+    local mp="$1"
+    _diag_ssh "check mount table for $mp" "/sbin/mount"
+    local rc=$?
+    if [ "$rc" -eq 255 ]; then
+        return 255
+    fi
+    if [[ "$diag_last_output" == *" on $mp "* || "$diag_last_output" == *" on $mp("* ]]; then
+        return 0
+    fi
+    return 1
+}
+
 parse_opt() {
     case "$1" in
         --)
@@ -157,6 +252,12 @@ parse_opt() {
             ;;
         --ramdisk)
             ramdisk=1
+            ;;
+        --diagnose)
+            diagnose=1
+            ;;
+        --diagnose-mount-test)
+            diagnose_mount_test=1
             ;;
         --dump-blobs)
             dump_blobs=1
@@ -1682,6 +1783,166 @@ _kill_if_running() {
         fi
     fi
 }
+
+# ---------------------------------------------------------------------------
+# --diagnose: safe, read-only inspection of the SSH ramdisk environment.
+#
+# Goals (see task writeup): identify device/mode, confirm SSH is up, list
+# disks/partitions/mounts as they already are, check for mount_apfs/
+# seputil/mount_filesystems without running them destructively, look for
+# sep-firmware on filesystems that are already mounted, sanity-check the
+# locally downloaded boot component files for the selected ramdisk version,
+# and report where the SSH link died if it does.
+#
+# This function MUST NOT call mount_filesystems, mount_apfs, or seputil
+# itself, and MUST NOT write to NVRAM or any APFS volume. The only place
+# that is allowed to touch mount_filesystems at all is the explicit,
+# separately-confirmed _diag_mount_test stage below, which still never
+# touches seputil or SEP firmware.
+# ---------------------------------------------------------------------------
+_diag_mount_test() {
+    _log_warn "--diagnose-mount-test requested. This will run the real mount_filesystems"
+    _log_warn "tool with its full, unredirected output so we can see exactly how it fails."
+    _log_warn "It does NOT touch SEP firmware, but a crash in mount_filesystems itself can"
+    _log_warn "still wedge the ramdisk and force a power-cycle of the device."
+    read -p "Type YES (all caps) to proceed with the live mount_filesystems test: " confirm
+    if [[ "$confirm" != "YES" ]]; then
+        _log_info "Mount test declined by user. Skipping."
+        return 0
+    fi
+    _log_info "Mount test: recording current mount table before the attempt"
+    _diag_ssh "pre-test mount table" "/sbin/mount"
+    [ "$ssh_connection_lost" = "1" ] && return 255
+
+    _log_info "Mount test: invoking mount_filesystems (output captured, not discarded)"
+    _diag_ssh "mount_filesystems" "bash -c mount_filesystems"
+    local mf_rc=$diag_last_rc
+    if [ "$ssh_connection_lost" = "1" ]; then
+        _log_stop "SSH connection dropped during mount_filesystems itself - this is the exact point of failure."
+        return 255
+    fi
+
+    _log_info "Mount test: recording mount table after the attempt"
+    _diag_ssh "post-test mount table" "/sbin/mount"
+    [ "$ssh_connection_lost" = "1" ] && return 255
+
+    for mp in /mnt1 /mnt2 /mnt6; do
+        if [[ "$diag_last_output" == *" on $mp "* || "$diag_last_output" == *" on $mp("* ]]; then
+            _log_ok "mount_filesystems mounted $mp"
+        else
+            _log_error "mount_filesystems did NOT mount $mp (mount_filesystems exit was $mf_rc)"
+        fi
+    done
+
+    _log_info "Mount test: unmounting again to leave the ramdisk in a clean state"
+    _diag_ssh "umount /mnt1" "/sbin/umount /mnt1"
+    _diag_ssh "umount /mnt2" "/sbin/umount /mnt2"
+    _diag_ssh "umount /mnt6" "/sbin/umount /mnt6"
+    return 0
+}
+
+_run_diagnose() {
+    mkdir -p "$dir"/logs
+    diagnose_log="$dir"/logs/diagnose_${deviceid}_$(date -u +%Y%m%d_%H%M%S).log
+    : > "$diagnose_log" 2>/dev/null
+
+    _log_info "Semaphorin --diagnose starting"
+    _log_info "Device: ${deviceid:-unknown} (model ${replace:-unknown}, CPID ${cpid:-unknown})"
+    _log_info "Target version: ${version:-unknown} | Currently-installed version (per prompt): ${r:-unknown}"
+    _log_info "Host OS: $os"
+    _log_info "Report file: $diagnose_log"
+
+    _log_info "Checking SSH ramdisk reachability"
+    _diag_ssh "ssh reachability (echo)" "echo semaphorin_diag_ok"
+    if [ "$ssh_connection_lost" = "1" ] || [[ "$diag_last_output" != *"semaphorin_diag_ok"* ]]; then
+        _log_stop "Could not reach the SSH ramdisk (device may not have booted it, or iproxy/USB is not forwarding). Aborting diagnostics."
+        return 1
+    fi
+    _log_ok "SSH ramdisk is reachable"
+
+    _diag_ssh "uname -a" "uname -a"
+    _diag_ssh "uptime (how long the ramdisk has been up)" "uptime" 2>/dev/null
+
+    _log_info "APFS inspection started (read-only; mount_filesystems is NOT called automatically)"
+    _diag_ssh "current mount table" "/sbin/mount"
+    [ "$ssh_connection_lost" = "1" ] && { _log_stop "Lost SSH while listing mounts"; return 1; }
+
+    _diag_ssh "raw disk device nodes" "ls -la /dev/ 2>/dev/null | grep -i disk"
+    [ "$ssh_connection_lost" = "1" ] && { _log_stop "Lost SSH while listing /dev disk nodes"; return 1; }
+
+    for tool in mount_apfs mount_filesystems seputil fsck_apfs newfs_apfs; do
+        _diag_ssh "locate $tool" "command -v $tool 2>/dev/null || which $tool 2>/dev/null"
+        if [ "$ssh_connection_lost" = "1" ]; then
+            _log_stop "Lost SSH while locating $tool"
+            return 1
+        fi
+        if [ -n "$diag_last_output" ]; then
+            _diag_ssh "metadata for $tool" "ls -la $diag_last_output 2>/dev/null"
+        else
+            _log_warn "$tool not found in PATH on this ramdisk"
+        fi
+    done
+    _log_info "APFS/SEP tool availability check complete (none of them were executed)"
+
+    _log_info "SEP firmware inspection started"
+    _log_info "Looking for sep-firmware/apticket on filesystems already mounted by the ramdisk itself (read-only, -xdev)"
+    _diag_ssh "search for sep-firmware on mounted filesystems" \
+        "find / -xdev \\( -iname 'sep-firmware*' -o -iname 'apticket*' \\) 2>/dev/null"
+    if [ "$ssh_connection_lost" = "1" ]; then
+        _log_stop "Lost SSH while searching for SEP firmware"
+        return 1
+    fi
+    if [ -n "$diag_last_output" ]; then
+        _log_ok "Found candidate SEP/apticket paths already visible: $diag_last_output"
+    else
+        _log_warn "No sep-firmware/apticket found on the filesystems that are already mounted. This is expected if /mnt1 (System) is not mounted yet - mounting it is what mount_filesystems/mount_apfs is for, and is NOT done automatically here."
+    fi
+
+    _log_info "Checking locally downloaded boot components for the selected ramdisk version ($r)"
+    local rd_dir="$dir/$deviceid/$cpid/ramdisk/$r"
+    if [ -d "$rd_dir" ]; then
+        for f in iBSS.img4 iBEC.img4 kernelcache.img4 devicetree.img4 trustcache.img4 ramdisk.img4; do
+            if [ -e "$rd_dir/$f" ]; then
+                local sz
+                sz=$(wc -c < "$rd_dir/$f" 2>/dev/null)
+                if [ "${sz:-0}" -eq 0 ]; then
+                    _log_error "$f exists but is zero bytes (corrupt/truncated download) at $rd_dir/$f"
+                else
+                    _log_ok "$f present, $sz bytes"
+                fi
+            else
+                _log_warn "$f missing from $rd_dir (not fatal if this device/version doesn't need it)"
+            fi
+        done
+    else
+        _log_warn "Expected ramdisk component directory not found: $rd_dir"
+    fi
+
+    _log_info "Checking previously backed-up SEP/activation material under $dir/$deviceid/0.0"
+    local bk_dir="$dir/$deviceid/0.0"
+    for f in apticket.der sep-firmware.img4 keybags; do
+        if [ -e "$bk_dir/$f" ]; then
+            _log_ok "$f already backed up at $bk_dir/$f ($(date -r "$bk_dir/$f" -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || stat -c %y "$bk_dir/$f" 2>/dev/null))"
+        else
+            _log_info "$f not yet backed up locally (would be fetched by --restore after mount_filesystems succeeds)"
+        fi
+    done
+
+    if [[ "$diagnose_mount_test" == 1 ]]; then
+        _diag_mount_test
+    else
+        _log_info "Skipping live mount_filesystems test (pass --diagnose-mount-test to run it explicitly)"
+    fi
+
+    if [ "$ssh_connection_lost" = "1" ]; then
+        _log_stop "Diagnostics ended early because the SSH/USB connection was lost. See the last [STOP]/[ERROR] lines above for the exact step."
+        return 1
+    fi
+
+    _log_info "Diagnose run complete. Full report saved to: $diagnose_log"
+    return 0
+}
+
 _boot() {
     if [[ "$cpid" == "0x8001" || "$cpid" == "0x8000" || "$cpid" == "0x8003" ]]; then
         kbag="24A0F3547373C6FED863FC0F321D7FEA216D0258B48413903939DF968CC2C0E571949EFB72DED8B55B8670932CA7A039"
@@ -1993,9 +2254,9 @@ if [[ "$boot" == 1 ]]; then
     fi
     exit 0
 fi
-if [[ "$ramdisk" == 1 || "$restore" == 1 || "$dump_blobs" == 1 || "$force_activation" == 1 || "$restore_activation" == 1 || "$dump_nand" == 1 || "$restore_nand" == 1 || "$restore_mnt1" == 1 || "$restore_mnt2" == 1 || "$disable_NoMoreSIGABRT" == 1 || "$NoMoreSIGABRT" == 1 ]]; then
+if [[ "$ramdisk" == 1 || "$restore" == 1 || "$diagnose" == 1 || "$dump_blobs" == 1 || "$force_activation" == 1 || "$restore_activation" == 1 || "$dump_nand" == 1 || "$restore_nand" == 1 || "$restore_mnt1" == 1 || "$restore_mnt2" == 1 || "$disable_NoMoreSIGABRT" == 1 || "$NoMoreSIGABRT" == 1 ]]; then
     _kill_if_running iproxy
-    if [[ "$ramdisk" == 1 || "$dump_blobs" == 1 || "$dump_nand" == 1 || "$restore_activation" == 1 || "$restore_nand" == 1 || "$restore_mnt1" == 1 || "$restore_mnt2" == 1 || "$disable_NoMoreSIGABRT" == 1 || "$NoMoreSIGABRT" == 1 ]]; then
+    if [[ "$ramdisk" == 1 || "$diagnose" == 1 || "$dump_blobs" == 1 || "$dump_nand" == 1 || "$restore_activation" == 1 || "$restore_nand" == 1 || "$restore_mnt1" == 1 || "$restore_mnt2" == 1 || "$disable_NoMoreSIGABRT" == 1 || "$NoMoreSIGABRT" == 1 ]]; then
         rdversion="$version"
         if [[ "$version" == "10."* || "$version" == "11.0" ]]; then
             rdversion="10.3.3"
@@ -2187,7 +2448,7 @@ if [[ "$ramdisk" == 1 || "$restore" == 1 || "$dump_blobs" == 1 || "$force_activa
         fi
     fi
     cd "$wd"
-    if [[ "$ramdisk" == 1 || "$dump_blobs" == 1 || "$dump_nand" == 1 || "$restore_activation" == 1 || "$restore_nand" == 1 || "$restore_mnt1" == 1 || "$restore_mnt2" == 1 || "$disable_NoMoreSIGABRT" == 1 || "$NoMoreSIGABRT" == 1 ]]; then
+    if [[ "$ramdisk" == 1 || "$diagnose" == 1 || "$dump_blobs" == 1 || "$dump_nand" == 1 || "$restore_activation" == 1 || "$restore_nand" == 1 || "$restore_mnt1" == 1 || "$restore_mnt2" == 1 || "$disable_NoMoreSIGABRT" == 1 || "$NoMoreSIGABRT" == 1 ]]; then
         if [[ "$version" == "16."* || "$version" == "17."* ]]; then
             pongo=1
         fi
@@ -2213,6 +2474,17 @@ if [[ "$ramdisk" == 1 || "$restore" == 1 || "$dump_blobs" == 1 || "$force_activa
     sleep 6
     "$bin"/iproxy 2222 22 & sleep 1
     sleep 2
+    if [[ "$diagnose" == 1 ]]; then
+        _run_diagnose
+        diag_exit=$?
+        if [[ "$ssh_connection_lost" != "1" ]]; then
+            $("$bin"/sshpass -p 'alpine' ssh -o StrictHostKeyChecking=no -p2222 root@localhost "/sbin/reboot &" 2> /dev/null &)
+        else
+            _log_warn "Not sending a reboot command - the SSH/USB link already appears to be down. Power-cycle the device manually if needed."
+        fi
+        _kill_if_running iproxy
+        exit "$diag_exit"
+    fi
     if [[ "$restore" == 1 ]]; then
         if [[ "$deviceid" == "iPhone10"* || "$cpid" == "0x8015"* ]]; then
             "$bin"/sshpass -p 'alpine' ssh -o StrictHostKeyChecking=no -p2222 root@localhost "/usr/sbin/nvram auto-boot=false" 2> /dev/null
@@ -2220,18 +2492,55 @@ if [[ "$ramdisk" == 1 || "$restore" == 1 || "$dump_blobs" == 1 || "$force_activa
         mkdir -p "$dir"/$deviceid/0.0/
         hit=0
         if [[ ! -e "$dir"/$deviceid/0.0/apticket.der || ! -e "$dir"/$deviceid/0.0/sep-firmware.img4 || ! -e "$dir"/$deviceid/0.0/keybags ]]; then
+            mkdir -p "$dir"/logs
+            diagnose_log="$dir"/logs/restore_backup_${deviceid}_$(date -u +%Y%m%d_%H%M%S).log
+            : > "$diagnose_log" 2>/dev/null
+            _log_info "Backing up pre-downgrade files required for the tethered restore"
             if [[ "$r" == "7."* || "$r" == "8."* || "$r" == "9."* || "$r" == "10.0"* || "$r" == "10.1"* || "$r" == "10.2"* ]]; then
-                "$bin"/sshpass -p 'alpine' ssh -o StrictHostKeyChecking=no -p2222 root@localhost "/sbin/mount -w -t hfs /dev/disk0s1s1 /mnt1" 2> /dev/null
-                "$bin"/sshpass -p 'alpine' ssh -o StrictHostKeyChecking=no -p2222 root@localhost "bash -c mount_filesystems" 2> /dev/null
-                "$bin"/sshpass -p 'alpine' ssh -o StrictHostKeyChecking=no -p2222 root@localhost "/sbin/mount -w -t hfs /dev/disk0s1s2 /mnt2" 2> /dev/null
+                _diag_ssh "mount /dev/disk0s1s1 -> /mnt1 (hfs)" "/sbin/mount -w -t hfs /dev/disk0s1s1 /mnt1"
+                _diag_ssh "mount_filesystems" "bash -c mount_filesystems"
+                _diag_ssh "mount /dev/disk0s1s2 -> /mnt2 (hfs)" "/sbin/mount -w -t hfs /dev/disk0s1s2 /mnt2"
             else
-                "$bin"/sshpass -p 'alpine' ssh -o StrictHostKeyChecking=no -p2222 root@localhost "bash -c mount_filesystems" 2> /dev/null
+                _diag_ssh "mount_filesystems" "bash -c mount_filesystems"
+            fi
+            if [[ "$ssh_connection_lost" == "1" ]]; then
+                echo "[-] SSH connection was lost while mounting filesystems. See $diagnose_log for the exact point of failure."
+                _kill_if_running iproxy
+                exit 1
+            fi
+            _remote_is_mounted "/mnt1"
+            mnt1_ok=$?
+            _remote_is_mounted "/mnt2"
+            mnt2_ok=$?
+            if [[ "$ssh_connection_lost" == "1" ]]; then
+                echo "[-] SSH connection was lost while verifying mounts. See $diagnose_log for the exact point of failure."
+                _kill_if_running iproxy
+                exit 1
+            fi
+            if [[ "$mnt1_ok" != 0 ]]; then
+                _log_error "/mnt1 did not mount - mount_filesystems/mount_apfs failed (see $diagnose_log for its full output)."
+                _log_error "Copying apticket.der/sep-firmware.img4 from /mnt1 would silently fail from here on, so stopping instead of continuing."
+                echo "[-] /mnt1 failed to mount. Aborting the backup step - see $diagnose_log, or re-run with --diagnose for a non-destructive look at why."
+                "$bin"/sshpass -p 'alpine' ssh -o StrictHostKeyChecking=no -p2222 root@localhost "/sbin/reboot &" 2> /dev/null &
+                _kill_if_running iproxy
+                exit 1
+            fi
+            if [[ "$mnt2_ok" != 0 ]]; then
+                _log_warn "/mnt2 did not mount - keybags/activation records under /mnt2 will be unavailable."
             fi
 			if [ ! -e "$dir"/$deviceid/0.0/apticket.der ]; then
-				"$bin"/sshpass -p "alpine" scp -o StrictHostKeyChecking=no -P 2222 root@localhost:/mnt1/System/Library/Caches/apticket.der "$dir"/$deviceid/0.0/apticket.der 2> /dev/null
+				if _remote_path_exists "/mnt1/System/Library/Caches/apticket.der"; then
+					"$bin"/sshpass -p "alpine" scp -o StrictHostKeyChecking=no -P 2222 root@localhost:/mnt1/System/Library/Caches/apticket.der "$dir"/$deviceid/0.0/apticket.der 2> /dev/null
+				else
+					_log_error "apticket.der not found at /mnt1/System/Library/Caches/apticket.der on the mounted volume - skipping copy instead of silently failing."
+				fi
 			fi
 			if [ ! -e "$dir"/$deviceid/0.0/sep-firmware.img4 ]; then
-				"$bin"/sshpass -p "alpine" scp -o StrictHostKeyChecking=no -P 2222 root@localhost:/mnt1/usr/standalone/firmware/sep-firmware.img4 "$dir"/$deviceid/0.0/sep-firmware.img4 2> /dev/null
+				if _remote_path_exists "/mnt1/usr/standalone/firmware/sep-firmware.img4"; then
+					"$bin"/sshpass -p "alpine" scp -o StrictHostKeyChecking=no -P 2222 root@localhost:/mnt1/usr/standalone/firmware/sep-firmware.img4 "$dir"/$deviceid/0.0/sep-firmware.img4 2> /dev/null
+				else
+					_log_error "sep-firmware.img4 not found at /mnt1/usr/standalone/firmware/sep-firmware.img4 on the mounted volume - skipping copy instead of silently failing."
+				fi
 			fi
 			if [ ! -e "$dir"/$deviceid/0.0/FUD ]; then
 				"$bin"/sshpass -p "alpine" scp -o StrictHostKeyChecking=no -r -P 2222 root@localhost:/mnt1/usr/standalone/firmware/FUD "$dir"/$deviceid/0.0/FUD 2> /dev/null
@@ -2303,10 +2612,12 @@ if [[ "$ramdisk" == 1 || "$restore" == 1 || "$dump_blobs" == 1 || "$force_activa
             "$bin"/sshpass -p 'alpine' ssh -o StrictHostKeyChecking=no -p2222 root@localhost "/sbin/umount /mnt1" 2> /dev/null
             "$bin"/sshpass -p 'alpine' ssh -o StrictHostKeyChecking=no -p2222 root@localhost "/sbin/umount /mnt2" 2> /dev/null
             if [[ ! -e "$dir"/$deviceid/0.0/apticket.der || ! -e "$dir"/$deviceid/0.0/sep-firmware.img4 || ! -e "$dir"/$deviceid/0.0/keybags ]]; then
+                _log_error "Required file(s) still missing after the backup step: $([ ! -e "$dir"/$deviceid/0.0/apticket.der ] && echo -n "apticket.der ")$([ ! -e "$dir"/$deviceid/0.0/sep-firmware.img4 ] && echo -n "sep-firmware.img4 ")$([ ! -e "$dir"/$deviceid/0.0/keybags ] && echo -n "keybags")"
                 echo "[*] An error occured while trying to back up the required files required to downgrade"
+                echo "[-] See $diagnose_log for the exact command and mount output that failed. Re-run with --diagnose for a safe, read-only look without wiping anything."
                 $("$bin"/sshpass -p 'alpine' ssh -o StrictHostKeyChecking=no -p2222 root@localhost "/sbin/reboot &" 2> /dev/null &)
                 _kill_if_running iproxy
-                exit 0
+                exit 1
             else
                 hit=1
                 echo "[*] Backed up the required files required to downgrade"
