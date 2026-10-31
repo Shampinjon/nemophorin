@@ -559,15 +559,24 @@ _wait_for_dfu() {
     fi
 }
 # Whether the iOS 14.3 ramdisk should be used for the restore stage. The key
-# check asks a web service via the bundled jar; when it fails (offline, service
-# change) the old fallback was the 12.5.4 ramdisk, which does not exist for
-# A11 devices (iPhone 8/X: api.ipsw.me has no 12.5.4 for them) and ended the run.
-# A11 devices always use 14.3: it is the ramdisk that was verified on an iPhone10,6.
+# check asks a web service via the bundled jar. When it fails (offline, service
+# change) the old fallback was the 12.5.4 ramdisk, which api.ipsw.me does not
+# offer for A11 devices (iPhone 8/X), so the run ended there. For A11 the check
+# is still run and its answer is printed; only if it does not say "true" is 14.3
+# used anyway (the version a ramdisk was verified with on an iPhone10,6), with a
+# warning. If 14.3 is really unavailable, the download step fails visibly.
 _ramdisk_14_3_available() {
-    if [[ "$deviceid" == "iPhone10"* || "$cpid" == "0x8015"* ]]; then
+    local answer
+    answer="$(./java/bin/java -jar ./Darwin/FirmwareKeysDl-1.0-SNAPSHOT.jar -e 14.3 $deviceid 2>&1 | tail -n 1)"
+    if [[ "$answer" == "true" ]]; then
         return 0
     fi
-    [[ "$(./java/bin/java -jar ./Darwin/FirmwareKeysDl-1.0-SNAPSHOT.jar -e 14.3 $deviceid)" == "true" ]]
+    if [[ "$deviceid" == "iPhone10"* || "$cpid" == "0x8015"* ]]; then
+        echo "[!] Key check for the 14.3 ramdisk did not return 'true' (got: '${answer:-nothing}')." >&2
+        echo "[!] 12.5.4 does not exist for $deviceid, so 14.3 is used anyway." >&2
+        return 0
+    fi
+    return 1
 }
 
 _download_ramdisk_boot_files() {
