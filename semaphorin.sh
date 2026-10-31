@@ -2043,6 +2043,54 @@ _diag_sep_steps() {
         return 255
     fi
     _log_info "seputil --load finished with exit code $rc2 and the SSH link is alive"
+    if [ "$rc2" -ne 0 ]; then
+        _log_warn "seputil --load failed (exit code $rc2); not going further."
+        return 0
+    fi
+    _diag_after_load
+    return $?
+}
+
+# Runs only after a seputil --load that returned 0. Exit code 0 alone does not
+# prove the SEP OS is up, so ask it (read-only queries), then optionally try a
+# READ-ONLY mount of the Data volume. Nothing is written; /mnt2 is unmounted.
+_diag_after_load() {
+    local seputil="/usr/libexec/seputil" ans args
+    _log_warn "After --load: read-only SEP queries (ping, securitymode, rom status) and the sepfw-loaded flag."
+    read -p "Type YES to run these post-load queries, anything else to skip: " ans
+    if [[ "$ans" != "YES" ]]; then
+        _log_info "Post-load queries declined by user."
+        return 0
+    fi
+    for args in "--ping" "--securitymode" "--rom status"; do
+        _log_info "running: seputil $args"
+        _diag_ssh "post-load seputil $args" "$seputil $args 2>&1"
+        if [ "$ssh_connection_lost" = "1" ]; then
+            _log_stop "SSH dropped during post-load 'seputil $args' - this is the exact point of failure."
+            return 255
+        fi
+    done
+    diag_quiet=1
+    _diag_ssh "post-load sepfw-loaded" "ioreg -l -p IODeviceTree -n sep 2>/dev/null | grep -E 'sepfw-loaded|sepfw-load-at-boot'; exit 0"
+    diag_quiet=0
+    [ "$ssh_connection_lost" = "1" ] && return 255
+
+    _log_warn "Optional: mount the Data volume READ-ONLY (mount -o rdonly /dev/disk0s1s2 /mnt2)."
+    _log_warn "Nothing is written, but the mount touches the keybag/SEP path and may hang the device."
+    read -p "Type YES to try the read-only Data mount, anything else to skip: " ans
+    if [[ "$ans" != "YES" ]]; then
+        _log_info "Data mount declined by user."
+        return 0
+    fi
+    _diag_ssh "mount -o rdonly /dev/disk0s1s2 /mnt2 (Data)" "/sbin/mount_apfs -o rdonly /dev/disk0s1s2 /mnt2 2>&1"
+    if [ "$ssh_connection_lost" = "1" ]; then
+        _log_stop "SSH dropped during the Data mount - this is the exact point of failure."
+        return 255
+    fi
+    if [ "$diag_last_rc" -eq 0 ]; then
+        _diag_ssh "Data volume top level (names only)" "ls /mnt2 2>&1 | head -20; exit 0"
+        _diag_ssh "umount /mnt2" "/sbin/umount /mnt2 2>&1; exit 0"
+    fi
     return 0
 }
 
