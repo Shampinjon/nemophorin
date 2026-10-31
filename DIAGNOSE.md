@@ -652,3 +652,40 @@ say whether the installed image fits it **without loading anything**; a
 "CAN NOT" would make `--load` pointless. It might still hang, so it is gated
 and its exit code and link state are logged. Exercised against a mocked SSH
 only.
+
+## 18. `--boot-check` result: this platform has no ART (a hypothesis withdrawn)
+
+### Facts (observed, run of 04:19)
+- `seputil --gigalocker-init` succeeded again (exit 0, link alive).
+- `seputil --boot-check <path>` printed
+  `IOKit wait timed out, volumes may be stale.`,
+  `bootCheck: Cannot perform boot check on non-ART platform. Assuming OK`
+  and `seputil: ttyin '/' failed`, exit 5. Nothing hung.
+- "IOKit wait timed out" is not one of seputil's own strings; it comes from a
+  library it links (it also links MSUDataAccessor).
+
+### What this means
+- seputil decides ART from the `has-art` property under `IODeviceTree:/arm-io/sep`.
+  Its message means that property is **absent**, so the platform is treated as
+  **non-ART**; the strings `seputil: no preflight checks when booting without
+  ART` / `platform does not support ART, no preflight` apply. **The earlier
+  idea (sections 15-16) that `--load` fails because the image does not match the
+  ART is therefore not supported for this device and is withdrawn.**
+- `ttyin '/' failed` was my mistake: `--boot-check` takes no file here, so the
+  path was treated as a "bare word" and seputil tried to type it into the SEP
+  console, which failed because no SEP OS is running. Nothing was damaged.
+  `--boot-check` is removed from the tool: without ART it only prints the line
+  above.
+
+### Still open
+- Why `seputil --load` returns `0xe00002d5` (from memory `kIOReturnBusy`).
+  seputil reads `sepfw-loaded` (prints `SEP firmware ... preloaded in memory`),
+  `sepfw-load-at-boot`, `has-art` and `protected-data-access` from the device
+  tree. If `sepfw-loaded` is set, "busy" would simply mean the image is
+  already staged/loaded.
+
+### Tool change
+The passive part of `--diagnose` now looks for `ioreg` in the ramdisk and, if it
+exists, prints those SEP device-tree properties (read-only registry query, no
+SEP traffic). If there is no `ioreg` it lists the ramdisk's executable names so
+we can look for another way. Mocked SSH only; not yet run on hardware.

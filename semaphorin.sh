@@ -176,8 +176,8 @@ Main operation mode:
     --update                   Check for a newer version, update without asking, then exit
     --no-update-check          Skip the startup check for a newer version
     --diagnose-sep-state       With --diagnose: read-only seputil queries (--rom status, --securitymode,
-                                --ping; then --rawlog and --boot-check one by one, each behind its own
-                                YES). Loads nothing, writes nothing; still talks to the SEP driver.
+                                --ping; then --rawlog behind its own YES). Loads nothing, writes
+                                nothing; still talks to the SEP driver.
                                 Implies --diagnose-apfs-ro.
     --diagnose-sep             With --diagnose: after the read-only mounts, runs the two SEP steps of
                                 mount_filesystems one at a time (seputil --gigalocker-init, then
@@ -1959,6 +1959,9 @@ _diag_mount_test() {
 # vanished from USB (no recovery/DFU), i.e. the kernel hung or panicked.
 # Requests that need a running SEP OS are therefore only offered, one by one and
 # behind their own YES, and only the ROM-level queries run unconditionally.
+# --boot-check is also gone: this platform has no "has-art", so it only prints
+# "non-ART platform. Assuming OK", and passing it a path makes seputil treat the
+# path as a bare word and try to type it into the SEP console ("ttyin").
 _diag_sep_state() {
     local active="$1" seputil="/usr/libexec/seputil" ans fw args ping_rc
     _log_warn "--diagnose-sep-state: seputil queries that only READ (ROM status, security mode, ping)."
@@ -1987,7 +1990,7 @@ _diag_sep_state() {
         _log_info "No SEP OS answered the ping: the SEP OS is not running in this ramdisk session."
         _log_warn "Requests that need a running SEP OS can hang the kernel in that state (an earlier --get-nonce did)."
     fi
-    for args in "--rawlog" "--boot-check $fw"; do
+    for args in "--rawlog"; do
         read -p "Also run 'seputil $args'? It may hang the device. Type YES to run, anything else to skip: " ans
         if [[ "$ans" != "YES" ]]; then
             _log_info "Skipped: seputil $args"
@@ -2024,22 +2027,6 @@ _diag_sep_steps() {
         fw="/mnt6/$active/usr/standalone/firmware/sep-firmware.img4"
     else
         fw="/mnt1/usr/standalone/firmware/sep-firmware.img4"
-    fi
-    # Optional: after gigalocker-init the driver should hold the ART, so
-    # --boot-check may tell whether this image fits it WITHOUT loading anything.
-    # Unverified: whether it can hang (an earlier --get-nonce did, before
-    # gigalocker-init). If it says CAN NOT, running --load is pointless.
-    read -p "Optional step 1b: run 'seputil --boot-check $fw' (compares the image with the ART, loads nothing; might hang)? Type YES to run, anything else to skip: " ans
-    if [[ "$ans" == "YES" ]]; then
-        _log_info "running: seputil --boot-check $fw"
-        _diag_ssh "seputil --boot-check $fw" "$seputil --boot-check $fw 2>&1"
-        if [ "$ssh_connection_lost" = "1" ]; then
-            _log_stop "SSH dropped during 'seputil --boot-check' - this is the exact point of failure."
-            return 255
-        fi
-        _log_info "seputil --boot-check finished with exit code $diag_last_rc and the SSH link is alive"
-    else
-        _log_info "Skipped: seputil --boot-check"
     fi
     read -p "Step 2: run 'seputil --load $fw'? Type YES to run, anything else to stop here: " ans
     if [[ "$ans" != "YES" ]]; then
@@ -2200,6 +2187,19 @@ _run_diagnose() {
     _diag_ssh "sep-firmware/apticket already visible (read-only, -xdev)" \
         "find / -xdev \\( -iname 'sep-firmware*' -o -iname 'apticket*' \\) 2>/dev/null; exit 0"
     diag_oneline=0
+    # The SEP properties seputil reads from the device tree (sepfw-loaded says
+    # whether the firmware was already loaded, which would explain 0xe00002d5).
+    # Read-only registry query; skipped if the ramdisk has no ioreg.
+    _diag_ssh "ioreg available?" 'for p in /usr/sbin/ioreg /usr/bin/ioreg /sbin/ioreg /bin/ioreg; do [ -x $p ] && echo $p; done; exit 0'
+    local ioreg_bin="$diag_last_output"
+    if [ -n "$ioreg_bin" ]; then
+        ioreg_bin=$(printf '%s' "$ioreg_bin" | head -n 1)
+        _diag_ssh "SEP device-tree properties (sepfw-loaded, has-art, ...)" \
+            "$ioreg_bin -p IODeviceTree -n sep -l -w0 2>&1 | grep -i -E 'sepfw|has-art|protected-data|sep-' ; exit 0"
+    else
+        _log_info "No ioreg in this ramdisk, so the SEP device-tree properties cannot be read passively."
+        _diag_ssh "executables in the ramdisk (names only)" "ls /usr/bin /usr/sbin /bin /sbin 2>/dev/null; exit 0"
+    fi
     if [ "$ssh_connection_lost" = "1" ]; then
         _log_stop "Lost SSH during the passive ramdisk checks"
         return 1
