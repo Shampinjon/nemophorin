@@ -2194,9 +2194,14 @@ _diag_apfs_ro_test() {
         if [ "$diag_last_rc" -eq 0 ]; then
             _diag_ssh "iOS version on $extra_sys" "grep -A1 -E 'ProductVersion|ProductBuildVersion' /mnt4/System/Library/CoreServices/SystemVersion.plist; exit 0"
             _diag_ssh "kernelcache / launchd present on $extra_sys" "ls -la /mnt4/System/Library/Caches/com.apple.kernelcaches /mnt4/sbin/launchd 2>&1 | head -8; exit 0"
+            _diag_ssh "files the restore placed on $extra_sys (sizes only)" "ls -la /mnt4/System/Library/Caches/apticket.der /mnt4/usr/standalone/firmware/sep-firmware.img4 2>&1; exit 0"
+            _diag_ssh "fstab on $extra_sys" "cat /mnt4/etc/fstab 2>&1 | head -10; exit 0"
             _diag_ssh "umount /mnt4" "/sbin/umount /mnt4 2>&1; exit 0"
         fi
     fi
+    # NVRAM is read only (nvram -p). Only keys that can explain a failed boot are
+    # logged, in case the kernel recorded a panic string there.
+    _diag_ssh "NVRAM (filtered: panic, boot-args, auto-boot, debug)" "/usr/sbin/nvram -p 2>&1 | grep -i -E 'panic|boot-args|auto-boot|debug'; exit 0"
     diag_oneline=$diag_ol
     _diag_ssh "mounted APFS volumes" "/sbin/mount | grep -E '/mnt[0-9]'"
     if [ "$sys_rc" -eq 0 ]; then
