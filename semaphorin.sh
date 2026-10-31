@@ -2171,6 +2171,32 @@ _diag_apfs_ro_test() {
     else
         _log_warn "No volume reported the xART role, so /mnt7 was not mounted."
     fi
+    # Volumes created by a previous --restore/--restore-erase (SystemX, DataX, ...)
+    # sit after the stock seven. Only roles are read, plus a read-only mount of the
+    # first extra System volume to see which iOS it holds.
+    local extra_sys="" extra_roles=""
+    diag_quiet=1
+    for n in 8 9 10; do
+        _diag_ssh "role of disk0s1s$n" "[ -e /dev/disk0s1s$n ] && $util -p /dev/disk0s1s$n; exit 0"
+        if [ "$ssh_connection_lost" = "1" ]; then diag_quiet=0; return 255; fi
+        [ -n "$diag_last_output" ] && extra_roles="$extra_roles s$n=[$diag_last_output]"
+        [[ "$diag_last_output" == *"System"* && "$diag_last_output" != *"Data"* && -z "$extra_sys" ]] && extra_sys="/dev/disk0s1s$n"
+    done
+    diag_quiet=0
+    if [ -n "$extra_roles" ]; then
+        _log_info "Extra APFS volumes after the stock seven:$extra_roles"
+    else
+        _log_info "No volumes after disk0s1s7 (nothing was created by a restore)."
+    fi
+    if [ -n "$extra_sys" ]; then
+        _diag_ssh "mount -o rdonly $extra_sys /mnt4 (extra System)" "/sbin/mount_apfs -o rdonly $extra_sys /mnt4"
+        if [ "$ssh_connection_lost" = "1" ]; then _log_stop "SSH dropped during the extra System mount."; return 255; fi
+        if [ "$diag_last_rc" -eq 0 ]; then
+            _diag_ssh "iOS version on $extra_sys" "grep -A1 -E 'ProductVersion|ProductBuildVersion' /mnt4/System/Library/CoreServices/SystemVersion.plist; exit 0"
+            _diag_ssh "kernelcache / launchd present on $extra_sys" "ls -la /mnt4/System/Library/Caches/com.apple.kernelcaches /mnt4/sbin/launchd 2>&1 | head -8; exit 0"
+            _diag_ssh "umount /mnt4" "/sbin/umount /mnt4 2>&1; exit 0"
+        fi
+    fi
     diag_oneline=$diag_ol
     _diag_ssh "mounted APFS volumes" "/sbin/mount | grep -E '/mnt[0-9]'"
     if [ "$sys_rc" -eq 0 ]; then
