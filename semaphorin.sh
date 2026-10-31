@@ -156,6 +156,9 @@ Main operation mode:
     --serial                   Enable serial debugging
     --ssh                      Tries to connect to ssh over usb interface to the connected device
     --restore                  Wipe device and downgrade ios
+    --restore-erase            Like --restore, but takes apticket/SEP firmware from Preboot only (read-only) and never
+                               mounts the Data volume or runs mount_filesystems. ALL USER DATA IS LOST, no keybags kept.
+                               For devices whose SEP does not answer in the ramdisk (see DIAGNOSE.md).
     --restore-activation       Copies the backed up activation records to /dev/disk0s1s2 on the iOS device
     --dump-nand                Backs up the entire contents of your iOS device to disk0.gz
     --dualboot-hfs             This is an experimental dualboot feature for iOS 10.3.3 devices only
@@ -404,6 +407,10 @@ parse_opt() {
             ;;
         --restore)
             restore=1
+            ;;
+        --restore-erase)
+            restore=1
+            restore_erase=1
             ;;
         --boot)
             boot=1
@@ -2178,6 +2185,64 @@ _diag_apfs_ro_test() {
     return 0
 }
 
+# --restore-erase backup step. The stock backup runs "bash -c mount_filesystems",
+# which on a device whose SEP does not answer mounts Data and takes the ramdisk
+# kernel down (see DIAGNOSE.md, sections 20-21). Everything needed here lives on
+# Preboot, which mounts read-only without the SEP, so only that is touched.
+# No keybags are backed up (the Data volume is never mounted); the user data is
+# going to be erased by the restore anyway. Returns 0 on success.
+_restore_erase_backup() {
+    local dst="$1" util="/System/Library/Filesystems/apfs.fs/apfs.util" n preboot_node="" active
+    _log_warn "--restore-erase: Preboot is mounted read-only; the Data volume and mount_filesystems are NOT used."
+    diag_quiet=1
+    for n in 1 2 3 4 5 6 7; do
+        _diag_ssh "role of disk0s1s$n" "$util -p /dev/disk0s1s$n; exit 0"
+        if [ "$ssh_connection_lost" = "1" ]; then diag_quiet=0; return 255; fi
+        [[ "$diag_last_output" == *"Preboot"* && -z "$preboot_node" ]] && preboot_node="/dev/disk0s1s$n"
+    done
+    diag_quiet=0
+    if [ -z "$preboot_node" ]; then
+        _log_error "No volume reported the Preboot role; cannot find apticket.der / sep-firmware.img4."
+        return 1
+    fi
+    _diag_ssh "mount -o rdonly $preboot_node /mnt6 (Preboot)" "/sbin/mount_apfs -o rdonly $preboot_node /mnt6"
+    if [ "$ssh_connection_lost" = "1" ]; then return 255; fi
+    if [ "$diag_last_rc" -ne 0 ]; then
+        _log_error "Preboot did not mount read-only."
+        return 1
+    fi
+    _diag_ssh "Preboot active slot" "cat /mnt6/active"
+    active="$diag_last_output"
+    if [ "$diag_last_rc" -ne 0 ] || [ -z "$active" ]; then
+        _log_error "/mnt6/active is missing or empty."
+        return 1
+    fi
+    mkdir -p "$dst"
+    local base="/mnt6/$active"
+    local f
+    for f in System/Library/Caches/apticket.der usr/standalone/firmware/sep-firmware.img4; do
+        if ! _remote_path_exists "$base/$f"; then
+            _log_error "$base/$f not found on Preboot."
+            return 1
+        fi
+        "$bin"/sshpass -p "alpine" scp -o StrictHostKeyChecking=no -o ConnectTimeout=8 -P 2222 \
+            "root@localhost:$base/$f" "$dst/$(basename "$f")" 2> /dev/null
+        if [ ! -s "$dst/$(basename "$f")" ]; then
+            _log_error "Copy of $f failed."
+            return 1
+        fi
+        _log_ok "copied $(basename "$f") ($(wc -c < "$dst/$(basename "$f")" | tr -d ' ') bytes)"
+    done
+    # Optional extras, same set the stock Preboot fallback copies; failures are not fatal.
+    [ -e "$dst/FUD" ] || "$bin"/sshpass -p "alpine" scp -o StrictHostKeyChecking=no -r -P 2222 "root@localhost:$base/usr/standalone/firmware/FUD" "$dst/FUD" 2> /dev/null
+    [ -e "$dst/Baseband" ] || "$bin"/sshpass -p "alpine" scp -o StrictHostKeyChecking=no -r -P 2222 "root@localhost:$base/usr/local/standalone/firmware/Baseband" "$dst/Baseband" 2> /dev/null
+    [ -e "$dst/firmware" ] || "$bin"/sshpass -p "alpine" scp -o StrictHostKeyChecking=no -r -P 2222 "root@localhost:$base/usr/standalone/firmware" "$dst/firmware" 2> /dev/null
+    [ -e "$dst/local" ] || "$bin"/sshpass -p "alpine" scp -o StrictHostKeyChecking=no -r -P 2222 "root@localhost:$base/usr/local" "$dst/local" 2> /dev/null
+    mkdir -p "$dst/keybags"
+    _diag_ssh "umount /mnt6" "/sbin/umount /mnt6 2>&1; exit 0"
+    return 0
+}
+
 # Copies the (public Apple, personalised) sep-firmware.img4 to the host so its
 # IMG4 metadata can be read there. No keys, keybags or user data are involved.
 _diag_fetch_sep() {
@@ -3015,6 +3080,30 @@ if [[ "$ramdisk" == 1 || "$restore" == 1 || "$diagnose" == 1 || "$dump_blobs" ==
         fi
         mkdir -p "$dir"/$deviceid/0.0/
         hit=0
+        if [[ "$restore_erase" == 1 && ( ! -e "$dir"/$deviceid/0.0/apticket.der || ! -e "$dir"/$deviceid/0.0/sep-firmware.img4 || ! -e "$dir"/$deviceid/0.0/keybags ) ]]; then
+            mkdir -p "$dir"/logs
+            diagnose_log="$dir"/logs/restore_backup_${deviceid}_$(date -u +%Y%m%d_%H%M%S).log
+            : > "$diagnose_log" 2>/dev/null
+            echo "[!] --restore-erase will ERASE ALL USER DATA on this device. No keybags/activation records are kept."
+            read -p "Type ERASE (all caps) to continue, anything else to abort: " erase_ans
+            if [[ "$erase_ans" != "ERASE" ]]; then
+                echo "[*] Aborted by user, nothing was changed."
+                "$bin"/sshpass -p 'alpine' ssh -o StrictHostKeyChecking=no -p2222 root@localhost "/sbin/reboot &" 2> /dev/null &
+                _kill_if_running iproxy
+                exit 0
+            fi
+            _log_info "--restore-erase: backing up apticket/SEP firmware from Preboot (no Data volume, no keybags)"
+            _restore_erase_backup "$dir"/$deviceid/0.0
+            erase_rc=$?
+            if [[ "$ssh_connection_lost" == "1" || "$erase_rc" != 0 ]]; then
+                echo "[-] --restore-erase backup step failed. Nothing has been erased yet. See $diagnose_log"
+                "$bin"/sshpass -p 'alpine' ssh -o StrictHostKeyChecking=no -p2222 root@localhost "/sbin/reboot &" 2> /dev/null &
+                _kill_if_running iproxy
+                exit 1
+            fi
+            hit=1
+            echo "[*] Backed up the required files required to downgrade (Preboot only, no keybags)"
+        fi
         if [[ ! -e "$dir"/$deviceid/0.0/apticket.der || ! -e "$dir"/$deviceid/0.0/sep-firmware.img4 || ! -e "$dir"/$deviceid/0.0/keybags ]]; then
             mkdir -p "$dir"/logs
             diagnose_log="$dir"/logs/restore_backup_${deviceid}_$(date -u +%Y%m%d_%H%M%S).log

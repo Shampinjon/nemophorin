@@ -725,3 +725,56 @@ looks normal (volumes, roles, mounts, gigalocker, no preloaded firmware, no
 ART). The one step never run is `seputil --load` itself. It is the stock step,
 writes nothing (volumes stay read-only in `--diagnose-sep`), but it is the one
 that failed before and it can hang the kernel.
+
+## 20. Real-hardware result: `seputil --load` returns 0, the SEP OS still does not answer
+
+Runs of 2026-10-31 04:31, 04:43 and 04:55 (iPhone10,6, 14.3 ramdisk, tethered
+14.3 installed). Facts from the logs:
+
+- `seputil --gigalocker-init` exit 0; `seputil --load /mnt6/<active>/usr/standalone/firmware/sep-firmware.img4`
+  exit 0 after ~3-8 s, no output, SSH alive. (The earlier `0xe00002d5` was seen
+  only inside the stock `mount_filesystems`; why it differs is unknown.)
+- After the load `seputil --ping` fails (exit 5), `--securitymode` fails with
+  `e00002d8`, and a second ping 15 s later fails again. So the SEP OS is not
+  coming up, it is not just slow. (Before the load `--rom status` answered.)
+- A ROM query after the load (`--rom status`, 04:44) hung ~44 s and the device
+  vanished from USB. A read-only `mount_apfs -o rdonly /dev/disk0s1s2 /mnt2`
+  (Data) after the load also ended with the SSH link reset and no USB device.
+  How long the mount hung is not recorded.
+
+Conclusions that follow directly from this:
+
+- The original crash is reproducible without the stock `mount_filesystems`; it
+  happens whenever something talks to a SEP that does not answer (post-load ROM
+  query, Data mount).
+- On this device, in this boot, the Data volume cannot be mounted. Anything
+  that needs `/mnt2` (keybag, activation records) is unavailable.
+- Why the SEP OS does not start stays a hypothesis (nonces in the IM4M, the
+  tethered boot setup). Not verified.
+
+## 21. `--restore-erase`: downgrade path that never mounts Data
+
+For a device whose data may be lost, `--restore-erase` replaces the stock backup
+step (which runs `bash -c mount_filesystems`, i.e. the step that takes the
+kernel down). It:
+
+1. asks for the word `ERASE`;
+2. finds the Preboot volume by role and mounts it **read-only**;
+3. copies `apticket.der` and `sep-firmware.img4` (plus FUD, Baseband, firmware,
+   local, as the stock Preboot fallback does) from `/mnt6/<active>`;
+4. creates an empty `keybags` directory, so later checks pass. No keybags are
+   backed up; the Data volume is never touched;
+5. unmounts Preboot and continues with the normal restore flow.
+
+Tested only with a mocked SSH layer (success, Preboot mount failure, missing
+file). **Not tested on hardware.** Unknowns that only a real run can answer:
+
+- whether the restore stage (deleting and re-creating the APFS volumes, writing
+  the 11.3 root filesystem) works with a SEP that does not answer. For target
+  11.x it does not call `mount_filesystems`, but a freshly created Data volume
+  may still be mounted through paths that need the SEP;
+- whether iOS 11.3 boots with the current (newer) SEP firmware and an empty
+  keybags directory.
+
+A failure after the volumes were deleted leaves the device in a state that a
+normal DFU restore can repair (checkm8/DFU is not affected by the filesystem).
