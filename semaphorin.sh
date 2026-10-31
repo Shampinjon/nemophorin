@@ -558,6 +558,18 @@ _wait_for_dfu() {
         done
     fi
 }
+# Whether the iOS 14.3 ramdisk should be used for the restore stage. The key
+# check asks a web service via the bundled jar; when it fails (offline, service
+# change) the old fallback was the 12.5.4 ramdisk, which does not exist for
+# A11 devices (iPhone 8/X: api.ipsw.me has no 12.5.4 for them) and ended the run.
+# A11 devices always use 14.3: it is the ramdisk that was verified on an iPhone10,6.
+_ramdisk_14_3_available() {
+    if [[ "$deviceid" == "iPhone10"* || "$cpid" == "0x8015"* ]]; then
+        return 0
+    fi
+    [[ "$(./java/bin/java -jar ./Darwin/FirmwareKeysDl-1.0-SNAPSHOT.jar -e 14.3 $deviceid)" == "true" ]]
+}
+
 _download_ramdisk_boot_files() {
     ipswurl=$(curl -k -sL "https://api.ipsw.me/v4/device/$deviceid?type=ipsw" | "$bin"/jq '.firmwares | .[] | select(.version=="'$3'")' | "$bin"/jq -s '.[0] | .url' --raw-output)
     rm -rf BuildManifest.plist
@@ -2908,7 +2920,7 @@ if [[ "$ramdisk" == 1 || "$restore" == 1 || "$diagnose" == 1 || "$dump_blobs" ==
             fi
         elif [[ "$version" == "10.3"* ]]; then
             _download_ramdisk_boot_files $deviceid $replace 10.3.3
-            if [[ "$(./java/bin/java -jar ./Darwin/FirmwareKeysDl-1.0-SNAPSHOT.jar -e 14.3 $deviceid)" == "true" ]]; then
+            if _ramdisk_14_3_available; then
                 _download_ramdisk_boot_files $deviceid $replace 14.3
             elif [[ "$deviceid" == "iPad"* && ! "$deviceid" == "iPad4"* ]]; then
                 _download_ramdisk_boot_files $deviceid $replace 14.3
@@ -2917,7 +2929,7 @@ if [[ "$ramdisk" == 1 || "$restore" == 1 || "$diagnose" == 1 || "$dump_blobs" ==
             fi
         elif [[ "$deviceid" == "iPhone8,1" && "$version" == "11.0" ]]; then
             _download_ramdisk_boot_files $deviceid $replace 10.3.3
-            if [[ "$(./java/bin/java -jar ./Darwin/FirmwareKeysDl-1.0-SNAPSHOT.jar -e 14.3 $deviceid)" == "true" ]]; then
+            if _ramdisk_14_3_available; then
                 _download_ramdisk_boot_files $deviceid $replace 14.3
             elif [[ "$deviceid" == "iPad"* && ! "$deviceid" == "iPad4"* ]]; then
                 _download_ramdisk_boot_files $deviceid $replace 14.3
@@ -2925,7 +2937,7 @@ if [[ "$ramdisk" == 1 || "$restore" == 1 || "$diagnose" == 1 || "$dump_blobs" ==
                 _download_ramdisk_boot_files $deviceid $replace 12.5.4
             fi
         elif [[ "$version" == "11."* || "$version" == "12."* || "$version" == "13."* || "$version" == "14."* ]]; then
-            if [[ "$(./java/bin/java -jar ./Darwin/FirmwareKeysDl-1.0-SNAPSHOT.jar -e 14.3 $deviceid)" == "true" ]]; then
+            if _ramdisk_14_3_available; then
                 _download_ramdisk_boot_files $deviceid $replace 14.3
             elif [[ "$deviceid" == "iPad"* && ! "$deviceid" == "iPad4"* ]]; then
                 _download_ramdisk_boot_files $deviceid $replace 14.3
@@ -3006,7 +3018,7 @@ if [[ "$ramdisk" == 1 || "$restore" == 1 || "$diagnose" == 1 || "$dump_blobs" ==
         elif [[ "$deviceid" == "iPhone8,1" && "$version" == "11.0" ]]; then
             cd "$dir"/$deviceid/$cpid/ramdisk/10.3.3
         elif [[ "$version" == "11."* || "$version" == "12."* || "$version" == "13."* || "$version" == "14."* ]]; then
-            if [[ "$(./java/bin/java -jar ./Darwin/FirmwareKeysDl-1.0-SNAPSHOT.jar -e 14.3 $deviceid)" == "true" ]]; then
+            if _ramdisk_14_3_available; then
                 cd "$dir"/$deviceid/$cpid/ramdisk/14.3
             elif [[ "$deviceid" == "iPad"* && ! "$deviceid" == "iPad4"* ]]; then
                 cd "$dir"/$deviceid/$cpid/ramdisk/14.3
@@ -3315,7 +3327,7 @@ if [[ "$ramdisk" == 1 || "$restore" == 1 || "$diagnose" == 1 || "$dump_blobs" ==
                 elif [[ "$deviceid" == "iPhone8,1" && "$version" == "11.0" ]]; then
                     cd "$dir"/$deviceid/$cpid/ramdisk/10.3.3
                 elif [[ "$version" == "11."* || "$version" == "12."* || "$version" == "13."* || "$version" == "14."* ]]; then
-                    if [[ "$(./java/bin/java -jar ./Darwin/FirmwareKeysDl-1.0-SNAPSHOT.jar -e 14.3 $deviceid)" == "true" ]]; then
+                    if _ramdisk_14_3_available; then
                         cd "$dir"/$deviceid/$cpid/ramdisk/14.3
                     elif [[ "$deviceid" == "iPad"* && ! "$deviceid" == "iPad4"* ]]; then
                         cd "$dir"/$deviceid/$cpid/ramdisk/14.3
