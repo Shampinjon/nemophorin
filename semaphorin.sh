@@ -175,9 +175,10 @@ Main operation mode:
                                 APFS/SEP state without mounting, wiping, or restoring anything
     --update                   Check for a newer version, update without asking, then exit
     --no-update-check          Skip the startup check for a newer version
-    --diagnose-sep-state       With --diagnose: read-only seputil queries (--securitymode, --rom status,
-                                --ping, --get-nonce, --art get, --boot-check, --rawlog). Loads nothing,
-                                writes nothing; still talks to the SEP driver. Implies --diagnose-apfs-ro.
+    --diagnose-sep-state       With --diagnose: read-only seputil queries (--rom status, --securitymode,
+                                --ping; then --rawlog and --boot-check one by one, each behind its own
+                                YES). Loads nothing, writes nothing; still talks to the SEP driver.
+                                Implies --diagnose-apfs-ro.
     --diagnose-sep             With --diagnose: after the read-only mounts, runs the two SEP steps of
                                 mount_filesystems one at a time (seputil --gigalocker-init, then
                                 seputil --load), each behind its own YES. Talks to the SEP; volumes
@@ -1953,11 +1954,16 @@ _diag_mount_test() {
 # Allow-list on purpose. NEVER add: --load, --restore, --gigalocker-init,
 # --art clear, --art-set, --new-nonce, --kill-nonce, --new-rom-nonce, --erase,
 # --commit-hash, --l4panic, --sepospanic, --requestpanic, --nap, --sleep.
+# Also never run --get-nonce: on real hardware (iPhone10,6, 14.3 ramdisk) it was
+# issued while the SEP OS was not answering, hung for ~15 s and the device then
+# vanished from USB (no recovery/DFU), i.e. the kernel hung or panicked.
+# Requests that need a running SEP OS are therefore only offered, one by one and
+# behind their own YES, and only the ROM-level queries run unconditionally.
 _diag_sep_state() {
-    local active="$1" seputil="/usr/libexec/seputil" ans fw args
-    _log_warn "--diagnose-sep-state: READ-ONLY seputil queries (security mode, ROM status, ping, nonce, ART, boot-check, mailbox log)."
-    _log_warn "They load nothing and write nothing, but they do talk to the SEP driver and a hang or panic is still possible."
-    read -p "Type YES (all caps) to run the read-only SEP queries: " ans
+    local active="$1" seputil="/usr/libexec/seputil" ans fw args ping_rc
+    _log_warn "--diagnose-sep-state: seputil queries that only READ (ROM status, security mode, ping)."
+    _log_warn "They load and write nothing, but they do talk to the SEP driver."
+    read -p "Type YES (all caps) to run the first read-only SEP queries: " ans
     if [[ "$ans" != "YES" ]]; then
         _log_info "SEP state queries declined by user. Skipping."
         return 0
@@ -1967,7 +1973,26 @@ _diag_sep_state() {
     else
         fw="/mnt1/usr/standalone/firmware/sep-firmware.img4"
     fi
-    for args in "--securitymode" "--rom status" "--ping" "--get-nonce" "--art get" "--boot-check $fw" "--rawlog"; do
+    ping_rc=0
+    for args in "--rom status" "--securitymode" "--ping"; do
+        _log_info "running: seputil $args"
+        _diag_ssh "seputil $args" "$seputil $args 2>&1"
+        [ "$args" = "--ping" ] && ping_rc=$diag_last_rc
+        if [ "$ssh_connection_lost" = "1" ]; then
+            _log_stop "SSH dropped during 'seputil $args' - this is the exact point of failure."
+            return 255
+        fi
+    done
+    if [ "$ping_rc" -ne 0 ]; then
+        _log_info "No SEP OS answered the ping: the SEP OS is not running in this ramdisk session."
+        _log_warn "Requests that need a running SEP OS can hang the kernel in that state (an earlier --get-nonce did)."
+    fi
+    for args in "--rawlog" "--boot-check $fw"; do
+        read -p "Also run 'seputil $args'? It may hang the device. Type YES to run, anything else to skip: " ans
+        if [[ "$ans" != "YES" ]]; then
+            _log_info "Skipped: seputil $args"
+            continue
+        fi
         _log_info "running: seputil $args"
         _diag_ssh "seputil $args" "$seputil $args 2>&1"
         if [ "$ssh_connection_lost" = "1" ]; then

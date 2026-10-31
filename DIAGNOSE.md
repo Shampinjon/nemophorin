@@ -580,3 +580,49 @@ SSH only (success, decline, non-zero exit, link drop); not yet run on hardware.
   (manifest hash / sepi nonce) vs the image's digests: do they match?
 - `--securitymode` / `--ping`: is a SEP OS answering at all, i.e. is the SEP
   already running before any `--load`?
+
+## 16. First SEP-state run on hardware (iPhone10,6, 14.3 ramdisk, 2026-10-31)
+
+### Facts (observed)
+| seputil command | result |
+|---|---|
+| `--securitymode` | exit 5: `Security mode command error: e00002d8`, `security mode query failed` |
+| `--rom status` | OK: `SEP status 0x1` |
+| `--ping` | exit 5: `ping failed` |
+| `--get-nonce` | hung ~15 s, then `Connection to localhost closed by remote host.`; liveness probe: connection reset |
+
+After the drop the USB mode was `none` at 1, 3 and 6 s: the device did **not**
+come back as recovery/DFU/ramdisk. That is a kernel hang or panic (the ramdisk
+boots with `wdt=-1`, so there is no watchdog reset), not a dead sshd. The same
+run had mounted System, Preboot and xART read-only without errors.
+
+### What this means (interpretation)
+- The SEP **ROM** answers, but the SEP **OS is not running** in this ramdisk
+  session: the ping fails and the security-mode query fails. From memory of
+  `IOReturn.h`, `0xe00002d8` is `kIOReturnNotReady` (please verify); that fits.
+- A request that needs the SEP OS (`--get-nonce`) hung the kernel instead of
+  failing cleanly. That matches the original symptom (blank screen, SSH closed,
+  device not necessarily rebooting).
+
+### Hypotheses (not verified)
+- The original crash is a **secondary effect**: `mount_filesystems` has no
+  `set -e`. If `seputil --load` does not start the SEP OS (it returned
+  `0xe00002d5` in the 16.x report), the script goes on to
+  `mount_apfs /dev/disk0s1s2 /mnt2` (the Data volume), which needs SEP
+  services. That would hang the kernel just like `--get-nonce` did.
+- If so, the real defect is why `seputil --load` does not bring the SEP OS up,
+  not the mounting. This run did **not** execute `--load`, so it is still open.
+
+### Why it matters for the downgrade
+`keybags` come from the Data volume (`/mnt2/keybags`), and the flow aborts
+without them (`missing ./keybags, which is required in order to proceed`);
+they are later copied into the new install. System, Preboot and xART mount
+fine without the SEP, but Data does not, so the backup step cannot finish
+until the SEP OS can be brought up.
+
+### Tool changes
+- `--get-nonce` and `--art get` were removed from `--diagnose-sep-state`;
+  `--get-nonce` is now on the "never run" list in the code comments.
+- The stage now runs only `--rom status`, `--securitymode` and `--ping`
+  unconditionally. `--rawlog` and `--boot-check` are offered one by one, each
+  behind its own `YES` with a hang warning. Tested against a mocked SSH only.
