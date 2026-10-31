@@ -689,3 +689,39 @@ The passive part of `--diagnose` now looks for `ioreg` in the ramdisk and, if it
 exists, prints those SEP device-tree properties (read-only registry query, no
 SEP traffic). If there is no `ioreg` it lists the ramdisk's executable names so
 we can look for another way. Mocked SSH only; not yet run on hardware.
+
+## 19. SEP device-tree properties read with `ioreg` (passive, no SEP traffic)
+
+### Facts (observed, run of 04:25)
+`ioreg -p IODeviceTree -n sep -l`, filtered, printed:
+- `"protected-data-access" = <01000000>`
+- `"sepfw-load-at-boot" = <01000000>`
+- `"sep-is-firmware-payload" = <01000000>`
+- `"SEPFW" = <>`
+- a child `iop-sep-nub` (`AppleA7IOPNub`): registered, matched, active, busy 0.
+
+**Not present** in the output: `sepfw-loaded` and `has-art`. The earlier
+`--boot-check` message ("non-ART platform") agrees with the missing `has-art`.
+
+### What this suggests (interpretation, not proven)
+- `sepfw-loaded` is absent: the firmware was **not** preloaded in memory by the
+  boot chain, so "busy because it is already loaded" is now unlikely.
+- `sepfw-load-at-boot` is `1`: the device tree says the SEP firmware load is
+  expected at boot. Whether the ramdisk kernel has a load of its own pending
+  (which could make a user-space `seputil --load` answer "busy") is a
+  hypothesis I cannot check from here.
+- The SEP IOP nub itself is up (`busy 0`), consistent with the ROM answering.
+
+### Side issue (not a fault)
+The red text in the terminal came from `ioreg`'s own ANSI colour codes, which
+were echoed unchanged. `_diag_ssh` now strips them from everything it captures
+and the run ends with a colour reset. The log also gets two read-only dumps in
+the default (non-compact) mode: the full `sep` device-tree node and the
+`AppleSEPManager` driver entry in the IOService plane.
+
+### Where this leaves the investigation
+Every precondition for `seputil --load` has now been checked on hardware and
+looks normal (volumes, roles, mounts, gigalocker, no preloaded firmware, no
+ART). The one step never run is `seputil --load` itself. It is the stock step,
+writes nothing (volumes stay read-only in `--diagnose-sep`), but it is the one
+that failed before and it can hang the kernel.

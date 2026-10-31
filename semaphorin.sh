@@ -242,6 +242,9 @@ _diag_ssh() {
         -o ServerAliveCountMax=2 \
         -p2222 root@localhost "$@" 2>&1)
     rc=$?
+    # ioreg (and others) colour their output even without a tty; those codes
+    # leave the host terminal red and clutter the log, so drop them.
+    out=$(printf '%s' "$out" | sed "s/$(printf '\033')\[[0-9;]*m//g")
     diag_last_output="$out"
     diag_last_rc=$rc
     # diag_oneline=1 folds multi-line output into one log line; diag_quiet=1
@@ -2196,6 +2199,12 @@ _run_diagnose() {
         ioreg_bin=$(printf '%s' "$ioreg_bin" | head -n 1)
         _diag_ssh "SEP device-tree properties (sepfw-loaded, has-art, ...)" \
             "$ioreg_bin -p IODeviceTree -n sep -l -w0 2>&1 | grep -i -E 'sepfw|has-art|protected-data|sep-' ; exit 0"
+        if [[ "$diagnose_compact" != 1 ]]; then
+            _diag_ssh "full IODeviceTree sep node (read-only)" \
+                "$ioreg_bin -p IODeviceTree -n sep -l -w0 2>&1 | sed -n '1,120p'; exit 0"
+            _diag_ssh "AppleSEPManager driver entry in the IOService plane (read-only)" \
+                "$ioreg_bin -c AppleSEPManager -l -w0 2>&1 | sed -n '1,120p'; exit 0"
+        fi
     else
         _log_info "No ioreg in this ramdisk, so the SEP device-tree properties cannot be read passively."
         _diag_ssh "executables in the ramdisk (names only)" "ls /usr/bin /usr/sbin /bin /sbin 2>/dev/null; exit 0"
@@ -2258,6 +2267,7 @@ _run_diagnose() {
         return 1
     fi
 
+    printf '\033[0m'
     _log_info "Diagnose run complete. Full report saved to: $diagnose_log"
     return 0
 }
