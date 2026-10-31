@@ -626,3 +626,29 @@ until the SEP OS can be brought up.
 - The stage now runs only `--rom status`, `--securitymode` and `--ping`
   unconditionally. `--rawlog` and `--boot-check` are offered one by one, each
   behind its own `YES` with a hang warning. Tested against a mocked SSH only.
+
+## 17. `seputil --gigalocker-init` on hardware (iPhone10,6, 14.3 ramdisk)
+
+### Facts (observed)
+- With System, Preboot and xART mounted **read-only**, `seputil --gigalocker-init`
+  returned exit code 0 and the SSH link stayed alive. Output:
+  `Gigalocker file (/mnt7/<uuid>.gl) exists` and
+  `Gigalocker initialization completed`. So this step needs no write access to
+  xART and does not hang the kernel here.
+- `seputil --load` was deliberately **not** run (the user stopped at that
+  prompt). Nothing hung, the volumes unmounted cleanly, and the
+  `sep-firmware.img4` copied is byte-identical to the earlier copies.
+
+### Consequence
+Every step of `mount_filesystems` except `seputil --load` and the Data-volume
+mount has now been exercised in isolation and works read-only. What remains
+unknown is exactly the pair the original failures point at.
+
+### New optional step 1b in `--diagnose-sep`
+After `--gigalocker-init` the tool offers (own `YES`) `seputil --boot-check
+<Preboot sep-firmware.img4>`. The idea, which is an **unverified hypothesis**,
+is that gigalocker-init makes the driver hold the ART, so `--boot-check` can
+say whether the installed image fits it **without loading anything**; a
+"CAN NOT" would make `--load` pointless. It might still hang, so it is gated
+and its exit code and link state are logged. Exercised against a mocked SSH
+only.

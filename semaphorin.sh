@@ -2025,6 +2025,22 @@ _diag_sep_steps() {
     else
         fw="/mnt1/usr/standalone/firmware/sep-firmware.img4"
     fi
+    # Optional: after gigalocker-init the driver should hold the ART, so
+    # --boot-check may tell whether this image fits it WITHOUT loading anything.
+    # Unverified: whether it can hang (an earlier --get-nonce did, before
+    # gigalocker-init). If it says CAN NOT, running --load is pointless.
+    read -p "Optional step 1b: run 'seputil --boot-check $fw' (compares the image with the ART, loads nothing; might hang)? Type YES to run, anything else to skip: " ans
+    if [[ "$ans" == "YES" ]]; then
+        _log_info "running: seputil --boot-check $fw"
+        _diag_ssh "seputil --boot-check $fw" "$seputil --boot-check $fw 2>&1"
+        if [ "$ssh_connection_lost" = "1" ]; then
+            _log_stop "SSH dropped during 'seputil --boot-check' - this is the exact point of failure."
+            return 255
+        fi
+        _log_info "seputil --boot-check finished with exit code $diag_last_rc and the SSH link is alive"
+    else
+        _log_info "Skipped: seputil --boot-check"
+    fi
     read -p "Step 2: run 'seputil --load $fw'? Type YES to run, anything else to stop here: " ans
     if [[ "$ans" != "YES" ]]; then
         _log_info "Stopped before seputil --load."
