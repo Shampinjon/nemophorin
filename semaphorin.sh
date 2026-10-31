@@ -175,6 +175,9 @@ Main operation mode:
                                 APFS/SEP state without mounting, wiping, or restoring anything
     --update                   Check for a newer version, update without asking, then exit
     --no-update-check          Skip the startup check for a newer version
+    --diagnose-sep-state       With --diagnose: read-only seputil queries (--securitymode, --rom status,
+                                --ping, --get-nonce, --art get, --boot-check, --rawlog). Loads nothing,
+                                writes nothing; still talks to the SEP driver. Implies --diagnose-apfs-ro.
     --diagnose-sep             With --diagnose: after the read-only mounts, runs the two SEP steps of
                                 mount_filesystems one at a time (seputil --gigalocker-init, then
                                 seputil --load), each behind its own YES. Talks to the SEP; volumes
@@ -331,6 +334,10 @@ parse_opt() {
             diagnose_mount_test=1
             ;;
         --diagnose-apfs-ro)
+            diagnose_apfs_ro=1
+            ;;
+        --diagnose-sep-state)
+            diagnose_sep_state=1
             diagnose_apfs_ro=1
             ;;
         --diagnose-sep)
@@ -1942,6 +1949,35 @@ _diag_mount_test() {
 # The two SEP calls mount_filesystems makes, run one at a time with their own
 # confirmation, a liveness check and the exit code after each. Volumes are still
 # mounted read-only by the caller, so nothing is written to the device.
+# Read-only seputil queries found in the 14.3 seputil (AppleSEPManager-665.62.1).
+# Allow-list on purpose. NEVER add: --load, --restore, --gigalocker-init,
+# --art clear, --art-set, --new-nonce, --kill-nonce, --new-rom-nonce, --erase,
+# --commit-hash, --l4panic, --sepospanic, --requestpanic, --nap, --sleep.
+_diag_sep_state() {
+    local active="$1" seputil="/usr/libexec/seputil" ans fw args
+    _log_warn "--diagnose-sep-state: READ-ONLY seputil queries (security mode, ROM status, ping, nonce, ART, boot-check, mailbox log)."
+    _log_warn "They load nothing and write nothing, but they do talk to the SEP driver and a hang or panic is still possible."
+    read -p "Type YES (all caps) to run the read-only SEP queries: " ans
+    if [[ "$ans" != "YES" ]]; then
+        _log_info "SEP state queries declined by user. Skipping."
+        return 0
+    fi
+    if [ -n "$active" ]; then
+        fw="/mnt6/$active/usr/standalone/firmware/sep-firmware.img4"
+    else
+        fw="/mnt1/usr/standalone/firmware/sep-firmware.img4"
+    fi
+    for args in "--securitymode" "--rom status" "--ping" "--get-nonce" "--art get" "--boot-check $fw" "--rawlog"; do
+        _log_info "running: seputil $args"
+        _diag_ssh "seputil $args" "$seputil $args 2>&1"
+        if [ "$ssh_connection_lost" = "1" ]; then
+            _log_stop "SSH dropped during 'seputil $args' - this is the exact point of failure."
+            return 255
+        fi
+    done
+    return 0
+}
+
 _diag_sep_steps() {
     local active="$1" seputil="/usr/libexec/seputil" ans fw
     _log_warn "--diagnose-sep: the next steps TALK TO THE SEP (the same two seputil calls mount_filesystems makes)."
@@ -2038,6 +2074,10 @@ _diag_apfs_ro_test() {
         _diag_fetch_sep "$active"
     else
         _log_warn "No /mnt6/active - seputil --load would fall back to /mnt1/usr/standalone/firmware/sep-firmware.img4"
+    fi
+    if [[ "$diagnose_sep_state" == 1 ]]; then
+        _diag_sep_state "$active"
+        [ "$ssh_connection_lost" = "1" ] && return 255
     fi
     if [[ "$diagnose_sep" == 1 ]]; then
         _diag_sep_steps "$active"

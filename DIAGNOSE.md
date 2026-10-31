@@ -528,3 +528,55 @@ the link dies it logs the step and the USB mode 1/3/6 s later (ramdisk /
 recovery / dfu / none). The Data volume is never mounted. Exercised against a
 mocked SSH only (success, decline, non-zero exit, link drop); not yet run on
 hardware.
+
+## 15. What the ramdisk's `seputil` itself says (static strings, never executed)
+
+Source: `/usr/libexec/seputil` copied from the 14.3 ramdisk
+(arm64 Mach-O, 171,760 bytes, `AppleSEPManager-665.62.1`) and its extracted
+strings. The `sep-firmware.img4` copied in the same run is byte-identical to
+the one copied the day before, so the on-disk SEP image has not changed.
+
+### Facts (from the binary)
+- The messages in the original reports map exactly to this tool:
+  `Gigalocker initialization completed` (from `--gigalocker-init`),
+  `load fw returned 0x%x` and `failed to load %s in %c%c%c%c mode` (from
+  `--load`).
+- `--load` is gated on **ART** (the anti-replay token). The strings show a
+  preflight against ART (`manifest hash`, `sepi digest`, `sepi nonce`,
+  `restore nonce`, `rsep ...`) with outcomes such as
+  `preflight: manifest hash matches sepi` and `preflight failed (%s ART)`, and
+  `bootCheck: SEP %s boot with ART` (`CAN NOT` when it would not).
+- It also checks whether the firmware is **already loaded**: it reads the
+  `sepfw-loaded` property under `IODeviceTree:/arm-io/sep` and prints
+  `SEP firmware %spreloaded in memory` / `was not`, and has a
+  `Skipping SEP firmware load` path. This makes the "SEP is already running"
+  idea from section 11 concrete, but it is still unverified.
+- Read-only queries exist: `--securitymode`, `--rom status`, `--ping`,
+  `--get-nonce`, `--art get`, `--boot-check <file>`, `--rawlog` (the SEP
+  mailbox log, the closest thing to the "SEP messages" the task asked for),
+  `--process-info`, `--dump-fw <file>`.
+- Dangerous options exist and are deliberately never used by this tool:
+  `--load`/`--restore*` (outside the confirmed `--diagnose-sep` step),
+  `--art clear`, `--art-set`, `--new-nonce`, `--kill-nonce`, `--new-rom-nonce`,
+  `--erase`, `--commit-hash`, `--nap`, `--sleep`, `--l4panic`, `--sepospanic`,
+  `--requestpanic`.
+
+### New opt-in stage: `--diagnose-sep-state`
+```
+sudo ./semaphorin.sh 11.3 --diagnose --diagnose-sep-state
+```
+Implies `--diagnose-apfs-ro`. After one typed `YES` it runs, one at a time,
+`--securitymode`, `--rom status`, `--ping`, `--get-nonce`, `--art get`,
+`--boot-check <the Preboot sep-firmware.img4>` and `--rawlog`, logging the
+command *before* it runs and the exit code and link state after. It loads and
+writes nothing, but it does talk to the SEP driver, so a hang or panic cannot
+be ruled out. The allow-list is fixed in the code. Exercised against a mocked
+SSH only (success, decline, non-zero exit, link drop); not yet run on hardware.
+
+### What to compare in the output
+- `--boot-check`: does the installed image count as bootable against the
+  current ART?
+- `--get-nonce` vs the `snon` tag in the image's manifest, and `--art get`
+  (manifest hash / sepi nonce) vs the image's digests: do they match?
+- `--securitymode` / `--ping`: is a SEP OS answering at all, i.e. is the SEP
+  already running before any `--load`?
