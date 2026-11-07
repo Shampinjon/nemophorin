@@ -189,8 +189,10 @@ Main operation mode:
     --diagnose-compact         With --diagnose: short one-line summaries instead of the full dumps
                                 (mount_filesystems source, directory scans, apfs.fs listing)
     --diagnose-apfs-ro         With --diagnose: probes APFS volume roles and mounts System/Preboot
-                                strictly read-only (no xART, gigalocker, seputil or Data volume) to
-                                separate an APFS mount failure from a SEP failure. Needs YES.
+                                strictly read-only (no gigalocker or seputil) to separate an APFS mount
+                                failure from a SEP failure. Also inspects the volumes a restore created
+                                (extra System: version, kernelcache, dyld; extra Data: panic logs, behind
+                                its own YES). Needs YES.
     --diagnose-mount-test      With --diagnose: explicitly also attempts a real mount_filesystems
                                 call (with full, non-redirected output) to see exactly how/where it
                                 fails. RISKY: the script itself runs seputil --gigalocker-init and --load (SEP).
@@ -2174,13 +2176,14 @@ _diag_apfs_ro_test() {
     # Volumes created by a previous --restore/--restore-erase (SystemX, DataX, ...)
     # sit after the stock seven. Only roles are read, plus a read-only mount of the
     # first extra System volume to see which iOS it holds.
-    local extra_sys="" extra_roles=""
+    local extra_sys="" extra_data="" extra_roles=""
     diag_quiet=1
     for n in 8 9 10; do
         _diag_ssh "role of disk0s1s$n" "[ -e /dev/disk0s1s$n ] && $util -p /dev/disk0s1s$n; exit 0"
         if [ "$ssh_connection_lost" = "1" ]; then diag_quiet=0; return 255; fi
         [ -n "$diag_last_output" ] && extra_roles="$extra_roles s$n=[$diag_last_output]"
         [[ "$diag_last_output" == *"System"* && "$diag_last_output" != *"Data"* && -z "$extra_sys" ]] && extra_sys="/dev/disk0s1s$n"
+        [[ "$diag_last_output" == *"Data"* && "$diag_last_output" != *"System"* && -z "$extra_data" ]] && extra_data="/dev/disk0s1s$n"
     done
     diag_quiet=0
     if [ -n "$extra_roles" ]; then
@@ -2196,7 +2199,39 @@ _diag_apfs_ro_test() {
             _diag_ssh "kernelcache / launchd present on $extra_sys" "ls -la /mnt4/System/Library/Caches/com.apple.kernelcaches /mnt4/sbin/launchd 2>&1 | head -8; exit 0"
             _diag_ssh "files the restore placed on $extra_sys (sizes only)" "ls -la /mnt4/System/Library/Caches/apticket.der /mnt4/usr/standalone/firmware/sep-firmware.img4 2>&1; exit 0"
             _diag_ssh "fstab on $extra_sys" "cat /mnt4/etc/fstab 2>&1 | head -10; exit 0"
+            _diag_ssh "dyld shared cache / dyld on $extra_sys (sizes only)" "ls -la /mnt4/System/Library/Caches/com.apple.dyld/ /usr/lib/dyld /mnt4/usr/lib/dyld 2>&1 | head -12; exit 0"
+            _diag_ssh "top level of $extra_sys (names only)" "ls /mnt4 2>&1 | head -30; exit 0"
             _diag_ssh "umount /mnt4" "/sbin/umount /mnt4 2>&1; exit 0"
+        fi
+    fi
+    # Extra Data volume of the restored OS (new volume created by the restore, not the
+    # stock Data on s2). Read-only, with its own confirmation, because a Data mount
+    # is what hung the kernel before when the SEP did not answer (DIAGNOSE.md, section 20).
+    if [ -n "$extra_data" ]; then
+        _log_warn "Optional: mount the restored Data volume $extra_data READ-ONLY (looks for panic logs; nothing is written)."
+        read -p "Type YES to try it, anything else to skip: " ans_xd
+        if [[ "$ans_xd" == "YES" ]]; then
+            _diag_ssh "mount -o rdonly $extra_data /mnt5 (extra Data)" "/sbin/mount_apfs -o rdonly $extra_data /mnt5 2>&1"
+            if [ "$ssh_connection_lost" = "1" ]; then _log_stop "SSH dropped during the extra Data mount - this is the exact point of failure."; return 255; fi
+            if [ "$diag_last_rc" -eq 0 ]; then
+                _diag_ssh "top level of $extra_data (names only)" "ls /mnt5 2>&1 | head -30; exit 0"
+                _diag_ssh "panic / crash logs on $extra_data (names, sizes)" "ls -la /mnt5/mobile/Library/Logs/CrashReporter /mnt5/log 2>&1 | head -40; find /mnt5 -maxdepth 6 \( -name 'panic*' -o -name '*.ips' \) 2>/dev/null | head -10; exit 0"
+                # Copy up to 3 panic logs to the host next to the log (not into it).
+                local pf pn=0
+                for pf in $(remote_cmd "find /mnt5 -maxdepth 6 -name 'panic*' 2>/dev/null | head -3" 2> /dev/null); do
+                    pn=$((pn+1))
+                    if "$bin"/sshpass -p 'alpine' scp -o StrictHostKeyChecking=no -o ConnectTimeout=8 -P 2222 \
+                        "root@localhost:$pf" "${diagnose_log%.log}_panic${pn}_$(basename "$pf")" 2> /dev/null; then
+                        _log_ok "copied $pf to ${diagnose_log%.log}_panic${pn}_$(basename "$pf")"
+                    fi
+                done
+                [ "$pn" = 0 ] && _log_info "No panic logs found on $extra_data (the OS may never have booted far enough to write one)."
+                _diag_ssh "umount /mnt5" "/sbin/umount /mnt5 2>&1; exit 0"
+            else
+                _log_warn "$extra_data did not mount read-only (see output above)."
+            fi
+        else
+            _log_info "Extra Data mount declined by user."
         fi
     fi
     # NVRAM is read only (nvram -p). Only keys that can explain a failed boot are
