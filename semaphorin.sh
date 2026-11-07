@@ -171,6 +171,9 @@ Main operation mode:
     --restore-mnt2             Copies the contents of disk0s1s2.gz to /dev/disk0s1s2 of the iOS device
     --boot                     Don't enter ramdisk or wipe device, just boot
     --boot-clean               Don't enter ramdisk or wipe device, just boot without seprmvr64
+    --boot-clean-restored      Like --boot-clean, but boots the volume a restore created (rd=disk0s1s8,
+                               e.g. the 11.3 from --restore-erase) instead of the stock System on disk0s1s1.
+                               Only for 10.3-14.x targets; the 9.x/15.x/16.x clean paths are unchanged.
     --clean                    Delete all the created boot files for your device
     --force-activation         Forces FactoryActivation on your device during restore
     --fix-auto-boot            Fixes booting into the main OS on A11 devices such as the iPhone X
@@ -419,6 +422,12 @@ parse_opt() {
             ;;
         --boot-clean)
             boot_clean=1
+            ;;
+        --boot-clean-restored)
+            # Like --boot-clean, but the root volume is the one a restore created (disk0s1s8),
+            # not the stock System on disk0s1s1.
+            boot_clean=1
+            boot_clean_restored=1
             ;;
         --clean)
             clean=1
@@ -1547,6 +1556,15 @@ _download_clean_boot_files() {
     #fi
     rm -rf BuildManifest.plist
     mkdir -p "$dir"/$1/clean/$cpid/$3
+    # The patched iBEC (with its rd= root) is only rebuilt when kernelcache is missing, so a
+    # cached one from the other mode would be reused. Remember which root it was built for and
+    # force a rebuild (kernelcache removed; the .dec downloads are kept) when that changes.
+    local want_rd="default" rd_marker="$dir"/$1/clean/$cpid/$3/.boot_root
+    [[ "$boot_clean_restored" == 1 ]] && want_rd="restored-s8"
+    if [ "$(cat "$rd_marker" 2> /dev/null)" != "$want_rd" ]; then
+        rm -f "$dir"/$1/clean/$cpid/$3/kernelcache
+        echo "$want_rd" > "$rd_marker"
+    fi
     rm -rf "$dir"/work
     mkdir "$dir"/work
     cd "$dir"/work
@@ -1753,7 +1771,9 @@ _download_clean_boot_files() {
             elif [[ "$3" == "16."* ]]; then
                 "$bin"/iBoot64Patcher "$dir"/$1/clean/$cpid/$3/iBEC.dec "$dir"/$1/clean/$cpid/$3/iBEC.patched -b "$boot_args rd=disk1s6 amfi=0xff cs_enforcement_disable=1 keepsyms=1 debug=0x2014e PE_i_can_has_debugger=1 amfi_get_out_of_my_way=1 amfi_allow_any_signature=1" -n
             else
-                "$bin"/iBoot64Patcher "$dir"/$1/clean/$cpid/$3/iBEC.dec "$dir"/$1/clean/$cpid/$3/iBEC.patched -b "$boot_args rd=disk0s1s1 amfi=0xff cs_enforcement_disable=1 keepsyms=1 debug=0x2014e PE_i_can_has_debugger=1 amfi_get_out_of_my_way=1 amfi_allow_any_signature=1" -n
+                local clean_rd="disk0s1s1"
+                [[ "$boot_clean_restored" == 1 ]] && clean_rd="disk0s1s8"
+                "$bin"/iBoot64Patcher "$dir"/$1/clean/$cpid/$3/iBEC.dec "$dir"/$1/clean/$cpid/$3/iBEC.patched -b "$boot_args rd=$clean_rd amfi=0xff cs_enforcement_disable=1 keepsyms=1 debug=0x2014e PE_i_can_has_debugger=1 amfi_get_out_of_my_way=1 amfi_allow_any_signature=1" -n
             fi
         fi
         "$bin"/img4 -i "$dir"/$1/clean/$cpid/$3/iBSS.patched -o "$dir"/$1/clean/$cpid/$3/iBSS.img4 -M IM4M -A -T ibss
