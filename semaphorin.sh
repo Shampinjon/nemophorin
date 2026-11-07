@@ -4242,7 +4242,29 @@ if [[ "$ramdisk" == 1 || "$restore" == 1 || "$diagnose" == 1 || "$dump_blobs" ==
             "$bin"/sshpass -p 'alpine' ssh -o StrictHostKeyChecking=no -p2222 root@localhost "/sbin/umount /mnt3" 2> /dev/null
             "$bin"/sshpass -p 'alpine' ssh -o StrictHostKeyChecking=no -p2222 root@localhost "/sbin/umount /mnt4" 2> /dev/null
             "$bin"/sshpass -p 'alpine' ssh -o StrictHostKeyChecking=no -p2222 root@localhost "/sbin/umount /mnt5" 2> /dev/null
-            "$bin"/sshpass -p 'alpine' ssh -o StrictHostKeyChecking=no -p2222 root@localhost "bash -c mount_filesystems" 2> /dev/null
+            if [[ "$restore_erase" == 1 ]]; then
+                # --restore-erase: stock "mount_filesystems" runs seputil --gigalocker-init/--load and mounts
+                # Data. With a SEP that does not answer that hangs the kernel (DIAGNOSE.md, sections 20-21), so it
+                # is skipped. Safe replacement: flush to disk, make sure the new volumes are unmounted, and report
+                # what is still mounted. Nothing here touches seputil, xART or the Data volume.
+                echo "[*] --restore-erase: skipping mount_filesystems (no seputil, no Data mount); syncing instead"
+                for _i in 1 2 3; do
+                    "$bin"/sshpass -p 'alpine' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=8 -p2222 root@localhost "/bin/sync" 2> /dev/null
+                    sleep 1
+                done
+                for _mp in /mnt3 /mnt4 /mnt5; do
+                    "$bin"/sshpass -p 'alpine' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=8 -p2222 root@localhost "/sbin/umount $_mp" 2> /dev/null
+                done
+                _left="$("$bin"/sshpass -p 'alpine' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=8 -p2222 root@localhost "/sbin/mount | grep -E ' on /mnt[0-9]'" 2> /dev/null)"
+                if [ -n "$_left" ]; then
+                    echo "[!] Still mounted after cleanup (continuing anyway):"
+                    echo "$_left"
+                else
+                    echo "[*] All /mnt* volumes are unmounted"
+                fi
+            else
+                "$bin"/sshpass -p 'alpine' ssh -o StrictHostKeyChecking=no -p2222 root@localhost "bash -c mount_filesystems" 2> /dev/null
+            fi
             #"$bin"/sshpass -p 'alpine' ssh -o StrictHostKeyChecking=no -p2222 root@localhost "/usr/sbin/nvram oblit-inprogress=5"
         else
             if [[ "$dualboot_hfs" == 1 ]]; then
